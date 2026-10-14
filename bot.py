@@ -39,9 +39,9 @@ LEARN_EVERY_N_MESSAGES = 15  # Каждые 15 сообщений фоновое
 SILENCE_HOURS_TO_REVIVE = 18  # Через сколько часов тишины Фил сам вбросит тему
 
 # Модели Groq (разделение для экономии лимитовЛёгкая модель для фонового анализа памяти
-# Модели Groq
-CHAT_MODEL = "llama-3.1-8b-instant"
-ANALYZER_MODEL = "llama-3.1-8b-instant"
+CHAT_MODEL = "llama-3.3-70b-versatile"
+ANALYZER_MODEL = "llama-3.3-70b-versatile"
+
 
 ai_client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
