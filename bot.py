@@ -38,9 +38,10 @@ REACTION_CHANCE = 0.08  # 8% шанс молча поставить реакци
 LEARN_EVERY_N_MESSAGES = 15  # Каждые 15 сообщений фоновое обучение
 SILENCE_HOURS_TO_REVIVE = 18  # Через сколько часов тишины Фил сам вбросит тему
 
-# Модели Groq (разделение для экономии лимитов)
-CHAT_MODEL = "llama-3.3-70b-versatile"      # Мощная модель для юмора и базара
-ANALYZER_MODEL = "llama-3.1-8b-instant"     # Лёгкая модель для фонового анализа памяти
+# Модели Groq (разделение для экономии лимитовЛёгкая модель для фонового анализа памяти
+# Модели Groq
+CHAT_MODEL = "llama-3.1-8b-instant"
+ANALYZER_MODEL = "llama-3.1-8b-instant"
 
 ai_client = AsyncOpenAI(
     api_key=GROQ_API_KEY,
