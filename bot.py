@@ -40,7 +40,7 @@ SILENCE_HOURS_TO_REVIVE = 18  # Через сколько часов тишин�
 
 # Модели Groq (разделение для экономии лимитовЛёгкая модель для фонового анализа памяти
 CHAT_MODEL = "llama-3.3-70b-versatile"
-ANALYZER_MODEL = "llama-3.3-70b-versatile"
+ANALYZER_MODEL = "llama-3.1-8b-instant"
 
 
 ai_client = AsyncOpenAI(
