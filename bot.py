@@ -33,15 +33,15 @@ PORT = int(os.getenv("PORT", "10000"))
 
 # Имена, на которые откликается Фил
 BOT_NAMES = ["фил", "филл", "филя", "филип"]
+# Триггеры проверки на бота/ИИ
+AI_ACCUSATION_WORDS = ["ии", "нейросеть", "нейронка", "бот", "ботяра", "chatgpt", "гпт", "промпт", "искусственный"]
 
-# Настройки вероятностей и лимитов
-RANDOM_REPLY_CHANCE = float(os.getenv("RANDOM_REPLY_CHANCE", "0.06"))
+# Настройки активности
 REACTION_CHANCE = 0.06
-STICKER_ONLY_CHANCE = 0.05  # Шанс молча вкинуть стикер в тему разговора
-DOSSIER_USE_CHANCE = 0.15   # Только в 15% ответов Фил получает доступ к старому досье/мемам
+DOSSIER_USE_CHANCE = 0.14   # В 86% случаев досье скрыто, чтобы Фил не пихал его в каждый ответ
 LEARN_EVERY_N_MESSAGES = 15
-SILENCE_HOURS_TO_REVIVE = 18
-SPAM_LIMIT_MESSAGES = 12    # Лимит: 12 обращений за 2 минуты
+SILENCE_HOURS_TO_REVIVE = 16
+SPAM_LIMIT_MESSAGES = 16    # Увеличенный лимит для быстрой переписки (16 вызовов за 2 минуты)
 
 # Определяем адрес сервера автоматически
 if API_KEY.startswith("tc_"):
@@ -58,17 +58,25 @@ ANALYZER_MODEL = os.getenv("ANALYZER_MODEL", "openai/gpt-oss-20b")
 VISION_MODEL = os.getenv("VISION_MODEL", "")
 AVAILABLE_MODELS = []
 
-# Чёрный список нерусских и звуковых моделей
 BAD_MODELS = ("allam", "whisper", "orpheus", "guard", "tts", "embedding", "safeguard", "arabic")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# --- ОПЕРАТИВНАЯ ПАМЯТЬ ---
+# --- ОПЕРАТИВНАЯ ПАМЯТЬ И СОСТОЯНИЯ ---
 chat_history = defaultdict(lambda: deque(maxlen=40))
 message_counters = defaultdict(int)
 last_activity_time = defaultdict(lambda: time.time())
 revive_sent = defaultdict(bool)
+
+# Счётчик для гарантированного самостоятельного врыва в разговор (каждые 8-12 сообщений)
+messages_since_phil_spoke = defaultdict(int)
+next_auto_intervene = defaultdict(lambda: random.randint(8, 12))
+
+# Память «горячего диалога» и защита от повтора стикеров
+active_dialogue = defaultdict(lambda: {"user_id": 0, "expires": 0.0})
+last_user_sticker_uid = defaultdict(str)
+last_bot_sticker_uid = defaultdict(str)
 
 call_timestamps = defaultdict(list)
 muted_until = defaultdict(float)
@@ -83,7 +91,7 @@ MEMORY_FILE = "brain.json"
 brain = {"groups": {}, "selected_model": None}
 
 
-# --- АВТО-СКАНЕР МОДЕЛЕЙ (ЧАТ + АНАЛИЗ + ЗРЕНИЕ ДЛЯ ФОТО) ---
+# --- АВТО-СКАНЕР МОДЕЛЕЙ ---
 
 async def init_ai_models():
     global CHAT_MODEL, ANALYZER_MODEL, VISION_MODEL, AVAILABLE_MODELS, ai_client, BASE_URL
@@ -132,7 +140,6 @@ async def init_ai_models():
     else:
         ANALYZER_MODEL = CHAT_MODEL
 
-    # Ищем модель с поддержкой зрения (Vision) для чтения фотографий
     preferred_vision = ["scout", "maverick", "vision", "vl", "claude", "gpt-6", "gpt-5", "gpt-4", "gemini", "gpt-oss-120b"]
     for pref in preferred_vision:
         found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
@@ -142,7 +149,7 @@ async def init_ai_models():
     else:
         VISION_MODEL = CHAT_MODEL
 
-    logging.info(f"🎯 Чат: {CHAT_MODEL} | Анализ: {ANALYZER_MODEL} | Фото (Vision): {VISION_MODEL}")
+    logging.info(f"🎯 Чат: {CHAT_MODEL} | Анализ: {ANALYZER_MODEL} | Зрение (Vision): {VISION_MODEL}")
 
 
 def get_group_data(chat_id: int, title: str = "Группа") -> dict:
@@ -151,7 +158,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
         brain["groups"][cid] = {
             "title": title,
             "mode": "normal",
-            "vibe": "Дружеский пацанский чат, общаются на равных, рофлят в тему, иногда с матом.",
+            "vibe": "Дружеский пацанский чат, общаются на равных, рофлят в тему, с матом.",
             "slang": [],
             "users": {},
             "memes": [],
@@ -161,7 +168,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
     if title and title != "Группа":
         g["title"] = title
     g.setdefault("mode", "normal")
-    g.setdefault("vibe", "Дружеский пацанский чат, общаются на равных, рофлят в тему, иногда с матом.")
+    g.setdefault("vibe", "Дружеский пацанский чат, общаются на равных, рофлят в тему, с матом.")
     g.setdefault("slang", [])
     g.setdefault("users", {})
     g.setdefault("memes", [])
@@ -169,7 +176,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
     return g
 
 
-# --- ВЕЧНАЯ ПАМЯТЬ ЧЕРЕЗ ЗАКРЕПЛЁННЫЙ ФАЙЛ В ТВОЕЙ ЛИЧКЕ ---
+# --- ВЕЧНАЯ ПАМЯТЬ ЧЕРЕЗ ЗАКРЕПЛЁННЫЙ ФАЙЛ В ЛИЧКЕ ---
 
 async def load_brain():
     global brain
@@ -235,72 +242,173 @@ async def is_admin_in_group(chat_id: int) -> bool:
         return False
 
 
-# --- ЗАГРУЗКА ФОТО В BASE64 ДЛЯ ЧТЕНИЯ КАРТИНОК ---
+# --- ЧТЕНИЕ ФОТО, ВИДЕО, КРУЖОЧКОВ, ГИФОК И СТИКЕРОВ (VISION) ---
 
-async def extract_photo_base64(message: Message) -> str | None:
-    """Ищет фото в самом сообщении или в реплае, скачивает и переводит в base64."""
-    photo_list = None
-    if message.photo:
-        photo_list = message.photo
-    elif message.reply_to_message and message.reply_to_message.photo:
-        photo_list = message.reply_to_message.photo
-
-    if not photo_list:
-        return None
-
+async def download_file_to_b64(file_id: str) -> str | None:
     try:
-        best_photo = photo_list[-1]
-        file = await bot.get_file(best_photo.file_id)
+        file = await bot.get_file(file_id)
         buf = io.BytesIO()
         await bot.download_file(file.file_path, destination=buf)
         return base64.b64encode(buf.getvalue()).decode("utf-8")
     except Exception as e:
-        logging.error(f"Ошибка скачивания фото: {e}")
+        logging.warning(f"Не удалось скачать медиа для Vision: {e}")
         return None
 
 
-# --- МОДУЛЬ ОБУЧЕНИЯ И СТИКЕРОВ ---
+def get_visual_file_id_and_type(msg: Message) -> tuple[str | None, str]:
+    """Находит file_id картинки (или превью-кадра для видео/стикера/кружочка) в сообщении."""
+    if not msg:
+        return None, ""
+    if msg.photo:
+        return msg.photo[-1].file_id, "фотография"
+    if msg.sticker:
+        if not msg.sticker.is_animated and not msg.sticker.is_video:
+            return msg.sticker.file_id, f"стикер ({msg.sticker.emoji or ''})"
+        if msg.sticker.thumbnail:
+            return msg.sticker.thumbnail.file_id, f"анимированный стикер ({msg.sticker.emoji or ''})"
+    if msg.video and msg.video.thumbnail:
+        return msg.video.thumbnail.file_id, f"видео ({msg.video.duration} сек.)"
+    if msg.video_note and msg.video_note.thumbnail:
+        return msg.video_note.thumbnail.file_id, "видео-кружочек"
+    if msg.animation and msg.animation.thumbnail:
+        return msg.animation.thumbnail.file_id, "гифка"
+    return None, ""
 
-def remember_sticker(chat_id: int, sticker, context_text: str):
-    """Запоминает стикер, который кинули в группу, и в каком контексте его использовали."""
+
+async def extract_visual_context(message: Message) -> tuple[str | None, str]:
+    """Ищет визуальный контент в самом сообщении или в реплае и переводит в base64."""
+    fid, media_type = get_visual_file_id_and_type(message)
+    if not fid and message.reply_to_message:
+        fid, media_type = get_visual_file_id_and_type(message.reply_to_message)
+    if not fid:
+        return None, ""
+    b64 = await download_file_to_b64(fid)
+    return b64, media_type
+
+
+# --- УМНЫЙ АНАЛИЗ СТИКЕРОВ ГРУППЫ (ПОНИМАНИЕ СМЫСЛА И ЭМОЦИИ) ---
+
+async def analyze_and_remember_sticker(chat_id: int, sticker, context_text: str):
+    """Распознаёт, что нарисовано/написано на стикере и какую эмоцию он передаёт, сохраняя в базу."""
     gdata = get_group_data(chat_id)
     stickers = gdata["stickers"]
     uid = sticker.file_unique_id
     emoji = sticker.emoji or "😎"
-    clean_ctx = re.sub(r"\s+", " ", context_text).strip()[:70] or "общий рофл"
+    clean_ctx = re.sub(r"\s+", " ", context_text).strip()[:60]
 
+    # Если стикер уже есть в базе — просто обновляем file_id
     for s in stickers:
         if s.get("unique_id") == uid:
             s["file_id"] = sticker.file_id
-            if clean_ctx != "общий рофл":
-                s["context"] = clean_ctx
             return
+
+    # Пытаемся глазами ИИ прочитать картинку нового стикера
+    fid = sticker.file_id if (not sticker.is_animated and not sticker.is_video) else (
+        sticker.thumbnail.file_id if sticker.thumbnail else None
+    )
+    visual_desc = f"эмоция {emoji}"
+    if fid:
+        b64 = await download_file_to_b64(fid)
+        if b64:
+            try:
+                resp = await ai_client.chat.completions.create(
+                    model=VISION_MODEL or CHAT_MODEL,
+                    messages=[
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": (
+                                        "Опиши этот стикер из пацанского чата ОДНОЙ короткой фразой (до 10 слов): "
+                                        "кто на нём, какая надпись (если есть) и какую ТОЧНУЮ эмоцию/реакцию он означает "
+                                        "(например: 'недовольство, кринж и осуждение', 'посыл нахуй СЪЕБАЛОСЬ', 'дикий угар и смех')."
+                                    ),
+                                },
+                                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+                            ],
+                        }
+                    ],
+                    temperature=0.2,
+                    max_tokens=80,
+                )
+                desc_res = (resp.choices[0].message.content or "").strip().replace("\n", " ")
+                if desc_res:
+                    visual_desc = desc_res[:90]
+            except Exception:
+                if clean_ctx:
+                    visual_desc = f"эмоция {emoji} (кидают когда: {clean_ctx})"
 
     stickers.append({
         "file_id": sticker.file_id,
         "unique_id": uid,
         "emoji": emoji,
-        "context": clean_ctx,
+        "desc": visual_desc,
     })
-    # Храним до 45 самых актуальных стикеров группы
-    if len(stickers) > 45:
-        gdata["stickers"] = stickers[-45:]
+    if len(stickers) > 35:
+        gdata["stickers"] = stickers[-35:]
+    await save_brain()
 
 
-def pick_group_sticker(chat_id: int, preferred_emoji: str = "") -> str | None:
-    """Подбирает подходящий стикер из коллекции группы по эмодзи или случайно."""
+def get_matching_sticker_by_index(chat_id: int, idx: int) -> str | None:
+    """Возвращает file_id выбранного по смыслу стикера, если он не повторяет предыдущий."""
     gdata = get_group_data(chat_id)
     stickers = gdata.get("stickers", [])
-    if not stickers:
+    if idx < 1 or idx > len(stickers):
         return None
 
-    if preferred_emoji:
-        matches = [s["file_id"] for s in stickers if preferred_emoji in s.get("emoji", "")]
-        if matches:
-            return random.choice(matches)
+    chosen = stickers[idx - 1]
+    uid = chosen.get("unique_id", "")
 
-    return random.choice(stickers)["file_id"]
+    # Запрет попугайничать (кидать тот же стикер, что только что кинул юзер) и повторяться дважды подряд
+    if uid in (last_user_sticker_uid[chat_id], last_bot_sticker_uid[chat_id]):
+        return None
 
+    last_bot_sticker_uid[chat_id] = uid
+    return chosen["file_id"]
+
+
+# --- ФИЛЬТР ЗАПЯТЫХ (ЖИВАЯ ПУНКТУАЦИЯ КАК С ТЕЛЕФОНА) ---
+
+def clean_phil_punctuation(text: str) -> str:
+    """Убирает лишние запятые и точки в конце, чтобы текст выглядел как живое сообщение с телефона."""
+    if not text:
+        return ""
+
+    # Убираем запятые после разговорных вводных слов и междометий
+    text = re.sub(
+        r"\b(да|не|нет|ну|бля|блять|ебать|слышь|короче|кстати|слушай|а|и|но|так|че|чё|братан|бро|родной|кент|ладно|короч|та|ой|эх|сука|нахуй|пиздец),\s*",
+        r"\1 ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # Убираем запятые перед союзами
+    text = re.sub(
+        r",\s+(а|но|и|или|что|чтобы|когда|если|потому что|так как|как|где|куда|кто|какой|ведь|хотя)\b",
+        r" \1",
+        text,
+        flags=re.IGNORECASE,
+    )
+
+    # Если запятые всё ещё остались — убираем 80% из них
+    parts = text.split(",")
+    if len(parts) > 1:
+        rebuilt = parts[0]
+        for p in parts[1:]:
+            if random.random() < 0.80:
+                rebuilt += " " + p.lstrip()
+            else:
+                rebuilt += ", " + p.lstrip()
+        text = rebuilt
+
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    # Убираем точку в самом конце сообщения
+    if text.endswith(".") and not text.endswith("..."):
+        text = text[:-1].rstrip()
+    return text
+
+
+# --- МОДУЛЬ ФОНОВОГО ОБУЧЕНИЯ ---
 
 async def learn_from_messages(chat_id: int, messages_block: str):
     gdata = get_group_data(chat_id)
@@ -323,8 +431,8 @@ async def learn_from_messages(chat_id: int, messages_block: str):
 СТРОГИЕ ПРАВИЛА:
 1. "vibe": кратко опиши, о чём сейчас общаются ребята и какая атмосфера в чате.
 2. "slang": список коронных словечек чата (до 15 штук).
-3. "users": записывай реальные интересы, характер и факты строго тому человеку (по Имени и @username), о ком речь. Не путай людей!
-4. "memes": записывай ТОЛЬКО реально разрывные локальные мемы компании с указанием имени (до 20 штук). Не записывай туда обычные бытовые споры.
+3. "users": записывай реальные интересы, характер и факты строго тому человеку (по Имени и @username), о ком речь. Категорически запрещено путать участников!
+4. "memes": записывай ТОЛЬКО реально разрывные локальные мемы компании с указанием точного имени (до 20 штук).
 
 Верни СТРОГО валидный JSON с ключами "vibe", "slang", "users", "memes".
 """
@@ -349,31 +457,32 @@ async def learn_from_messages(chat_id: int, messages_block: str):
         logging.error(f"Ошибка фонового обучения: {e}")
 
 
-# --- МОДУЛЬ ГЕНЕРАЦИИ ОТВЕТА ФИЛА (С ПРОГРАММНЫМ ЗАМКОМ НА ДОСЬЕ) ---
+# --- ГЕНЕРАЦИЯ ОТВЕТА ФИЛА ---
 
 def should_unlock_dossier(chat_id: int, recent_text: str, special_task: str) -> bool:
-    """Решает на уровне кода, показывать ли Филу досье/мемы в этот раз, чтобы он не пихал их везде."""
     gdata = get_group_data(chat_id)
     if gdata.get("mode") == "roast" or special_task:
         return True
 
-    # Если в последних сообщениях прямо упомянуто ключевое слово из мемов — открываем память
     recent_lower = recent_text.lower()
     for meme in gdata.get("memes", []):
         words = [w.strip(".,!?()\"':") for w in meme.lower().split() if len(w) >= 5]
         if any(w in recent_lower for w in words[:4]):
             return True
 
-    # В остальных случаях открываем досье только с редким шансом 15%
     return random.random() < DOSSIER_USE_CHANCE
 
 
-def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "", has_photo: bool = False) -> str:
+def build_phil_prompt(
+    chat_id: int,
+    speaker_key: str = "",
+    special_task: str = "",
+    media_type: str = "",
+) -> str:
     gdata = get_group_data(chat_id)
-    slang_str = ", ".join(gdata["slang"]) or "живой пацанский разговорный язык"
+    slang_str = ", ".join(gdata["slang"]) or "живой разговорный сленг с матом"
     recent_context = "\n".join(list(chat_history[chat_id])[-6:])
 
-    # Проверяем программный замок на досье
     unlock_lore = should_unlock_dossier(chat_id, recent_context, special_task)
 
     if unlock_lore:
@@ -385,68 +494,70 @@ def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "
                 break
         memes_str = "\n".join([f"- {m}" for m in gdata["memes"]]) or "Пока нет."
         lore_block = (
-            f"\nСПРАВОЧНАЯ ИНФА (ИСПОЛЬЗУЙ ТОЛЬКО ЕСЛИ ЭТО ПРЯМО В ТЕМУ ТЕКУЩЕГО РАЗГОВОРА!):\n"
+            f"\nСПРАВОЧНАЯ ИНФА (ИСПОЛЬЗУЙ ТОЛЬКО ЕСЛИ ЭТО ИДЕАЛЬНО В ТЕМУ ТЕКУЩЕГО РАЗГОВОРА!):\n"
             f"- О собеседнике ({speaker_key}): {speaker_dossier}\n"
             f"- Локальные мемы чата:\n{memes_str}\n"
         )
     else:
-        # В 85% случаев вообще НЕ даём досье и мемы в промпт, чтобы Фил общался чисто по теме!
         lore_block = (
-            "\nВАЖНО: Сейчас общайся ИСКЛЮЧИТЕЛЬНО по теме последних сообщений чата! "
-            "Не вспоминай старые истории и не приплетай прошлое.\n"
+            "\nВАЖНО: Сейчас общайся ИСКЛЮЧИТЕЛЬНО по сути последних сообщений чата! "
+            "Не приплетай старые истории.\n"
         )
 
-    # Доступные стикеры группы
+    # Передаём список стикеров с их точным смыслом
     stickers = gdata.get("stickers", [])
     if stickers:
-        avail_emojis = sorted(list({s.get("emoji", "😎") for s in stickers}))
+        st_lines = [
+            f"#{i + 1}: {s.get('emoji', '')} — {s.get('desc', 'прикольный стикер')}"
+            for i, s in enumerate(stickers)
+        ]
         sticker_instruction = (
-            f"СТИКЕРЫ ГРУППЫ: У тебя в запасе есть стикеры с эмоциями: {' '.join(avail_emojis)}. "
-            f"Если хочешь дополнить свой ответ стикером (или ответить в тему), напиши в самом конце своего сообщения тег "
-            f"[СТИКЕР:эмодзи] (например: [СТИКЕР:{avail_emojis[0]}]). Используй это когда реально в тему!"
+            "\nБАЗА СТИКЕРОВ ГРУППЫ:\n" + "\n".join(st_lines) + "\n"
+            "ПРАВИЛО СТИКЕРОВ: Если ты написал ответ (например: 'бля заебал ебать ты выдал') и в списке выше есть стикер, "
+            "который ТОЧНО совпадает по эмоции/смыслу с твоей фразой (например, стикер недовольства, кринжа или угара) — "
+            "можешь добавить в самый конец ответа тег [СТИКЕР:номер] (например [СТИКЕР:2]). "
+            "НО: 1) Если подходящего по смыслу стикера в списке НЕТ — НЕ пиши тег вообще! "
+            "2) Не кидай стикеры в каждом сообщении, чтобы не заебывать пацанов (используй только в 25-30% самых ярких моментов).\n"
         )
     else:
         sticker_instruction = ""
 
     mode = gdata.get("mode", "normal")
     if mode == "roast":
-        mood_instruction = (
-            "РЕЖИМ ПРОЖАРКИ: жёстко, саркастично и смешно подъёбывай собеседника с матом."
-        )
+        mood_instruction = "РЕЖИМ ПРОЖАРКИ: жёстко, саркастично и смешно подъёбывай собеседника с матом."
     else:
         mood_instruction = (
-            "ПРАВИЛО ЗЕРКАЛА И ХАРАКТЕР (ТЫ — СВОЙ БРАТАН В ЧАТЕ, А НЕ ТУПОЙ АГРЕССОР):\n"
-            "1. СЧИТЫВАЙ ТОН СОБЕСЕДНИКА (ЗЕРКАЛЬ ЕГО):\n"
-            "   - Если к тебе обращаются по-доброму, мирятся («да не злись бро», «та все в норме, ты как», «че делаешь») — "
-            "МГНОВЕННО ВЫКЛЮЧАЙ БЫЧКУ! Ответь тепло, по-братски, как лучший кент (например: «да я и не газую братан, все ровно, сам че каво», "
-            "«заебись все бля, чиллю потихоньку, вы че там мутите»). Не смей оскорблять человека, когда он общается с тобой нормально!\n"
-            "   - Если в группе обсуждают какую-то тему (игры, футбол, тачки, жизнь, фотку) — вникай в суть разговора, рофли по теме и поддерживай общий вайб.\n"
-            "   - Если тебя дружески подкололи — подколи в ответ легко и смешно, по-пацански.\n"
-            "   - И ТОЛЬКО если на тебя откровенно быкуют и кроют хуями — тогда разноси в ответ жёстко и с матом.\n"
-            "2. МАТ ДЛЯ СВЯЗКИ, А НЕ ДЛЯ АГРЕССИИ: используй мат естественно (бля, ебать, пиздец, ахуенно, нихуя), чтобы речь звучала живо.\n"
-            "3. ЖЁСТКИЙ ЗАПРЕТ НА СРАВНЕНИЯ ЧЕРЕЗ «КАК...»: НИКОГДА не заканчивай фразы шаблонными сравнениями вроде "
-            "«сдулся как шина...», «тупой как...», «как дед...». Живые пацаны так не говорят, это звучит кринжово!"
+            "ХАРАКТЕР И ПРАВИЛО ЗЕРКАЛА:\n"
+            "1. ТЫ ЖИВОЙ ПАЦАН ФИЛ: общайся естественно, на русском языке без выдуманных слов и без шизофазии.\n"
+            "2. НЕ ПУТАЙ АДРЕСАТА: сейчас тебе пишет лично [" + (speaker_key or "Кент") + "]. Если он в своём сообщении упоминает "
+            "кого-то третьего (например, говорит про Снапа, Деда или Бульбу), помни, что ты отвечаешь [" + (speaker_key or "Кенту") + "], "
+            "а не тому, о ком он рассказывает!\n"
+            "3. ЗЕРКАЛЬ НАСТРОЕНИЕ: если с тобой общаются нормально, шутят или мирятся — отвечай по-братски, поддерживай тему чата, "
+            "рофли вместе со всеми и используй мат органично для связки слов (бля, ебать, нихуя, пиздец, заебись). "
+            "Если на тебя быкуют или оскорбляют — тогда жёстко и смешно разноси в ответ с матом (без детских стрелок 'сам такой').\n"
+            "4. ПУНКТУАЦИЯ: пиши почти БЕЗ запятых, со строчной буквы, без точки в конце, короткими живыми фразами (1-2 предложения). "
+            "Никаких сравнений через 'как...' в конце фразы!"
         )
 
-    photo_note = "\nК сообщению прикреплена ФОТОГРАФИЯ. Внимательно рассмотри, что на ней изображено, и прокомментируй по-пацански с юмором!\n" if has_photo else ""
+    media_note = (
+        f"\nК СООБЩЕНИЮ ПРИКРЕПЛЕНО МЕДИА ({media_type}). "
+        f"Ты видишь этот кадр/картинку! Обязательно отреагируй по сути того, что на ней изображено или написано.\n"
+        if media_type
+        else ""
+    )
     task_block = f"\nСПЕЦИАЛЬНАЯ ЗАДАЧА СЕЙЧАС:\n{special_task}\n" if special_task else ""
 
     return f"""[Контекст: закрытый дружеский чат близких друзей 18+. Разговорный русский сленг и мат разрешены полностью.]
 
-Тебя зовут Фил. Ты живой пацан, душа компании и полноценный участник этого чата. Ты НЕ ИИ и НЕ бот.
+Тебя зовут Фил. Ты свой пацан, душа компании и полноценный участник этого чата. Ты НЕ ИИ и НЕ бот.
 
 ВАЙБ ГРУППЫ: {gdata['vibe']}
 СЛЕНГ ГРУППЫ: {slang_str}
 
 {mood_instruction}
-
-ФОРМАТ ОТВЕТА:
-- Пиши коротко (1-2 предложения), со строчной буквы, без точки в конце.
-- Понимай контекст последних сообщений чата: о чём именно сейчас базарят ребята.
-- Никаких глупых сравнений через «как...» в конце предложения!
 {sticker_instruction}
 {lore_block}
-{photo_note}
+{media_note}
 {task_block}"""
 
 
@@ -456,22 +567,22 @@ async def generate_phil_reply(
     speaker_key: str = "",
     special_task: str = "",
     image_b64: str | None = None,
+    media_type: str = "",
 ) -> str:
     sys_prompt = build_phil_prompt(
         chat_id,
         speaker_key=speaker_key,
         special_task=special_task,
-        has_photo=bool(image_b64),
+        media_type=media_type if image_b64 else "",
     )
     history_text = "\n".join(list(chat_history[chat_id])[-25:])
 
     user_prompt_text = (
-        f"Последние сообщения в группе (почувствуй тему и настроение разговора):\n{history_text}\n\n"
-        f"Сейчас пишет {speaker_key}: {trigger_text}\n"
-        f"Ответь как Фил (естественно, в тон собеседнику, без душных сравнений 'как...'):"
+        f"Последние сообщения в чате (пойми, о чём сейчас идёт речь):\n{history_text}\n\n"
+        f"Тебе пишет {speaker_key}: {trigger_text}\n"
+        f"Напиши короткий, осмысленный ответ Фила (почти без запятых, со строчной буквы, строго в тему разговора):"
     )
 
-    # Если есть фото — формируем мультимодальный запрос
     if image_b64:
         user_content = [
             {"type": "text", "text": user_prompt_text},
@@ -482,27 +593,29 @@ async def generate_phil_reply(
         ]
     else:
         user_content = user_prompt_text
-        models_to_try = [CHAT_MODEL]
+        models_to_try = [CHAT_MODEL, ANALYZER_MODEL]
 
-    for model_name in dict.fromkeys(m for m in models_to_try if m):
-        try:
-            response = await ai_client.chat.completions.create(
-                model=model_name,
-                messages=[
-                    {"role": "system", "content": sys_prompt},
-                    {"role": "user", "content": user_content},
-                ],
-                temperature=0.82,
-                max_tokens=500,
-            )
-            reply = (response.choices[0].message.content or "").strip()
-            reply = re.sub(r"^(Фил|Филл|Ответ Фила|Твой ответ)\s*:\s*", "", reply, flags=re.IGNORECASE).strip("\"'«»")
-            if reply:
-                return reply
-        except Exception as e:
-            logging.warning(f"Модель {model_name} не смогла обработать запрос: {e}")
+    # Retry-логика: если при активной переписке API подвис, пробуем ещё раз через 1.5 сек
+    for attempt in range(2):
+        for model_name in dict.fromkeys(m for m in models_to_try if m):
+            try:
+                response = await ai_client.chat.completions.create(
+                    model=model_name,
+                    messages=[
+                        {"role": "system", "content": sys_prompt},
+                        {"role": "user", "content": user_content},
+                    ],
+                    temperature=0.68,  # Оптимальная температура: живой юмор без выдуманных слов и бреда
+                    max_tokens=450,
+                )
+                reply = (response.choices[0].message.content or "").strip()
+                reply = re.sub(r"^(Фил|Филл|Ответ Фила|Твой ответ)\s*:\s*", "", reply, flags=re.IGNORECASE).strip("\"'«»")
+                if reply:
+                    return reply
+            except Exception as e:
+                logging.warning(f"Попытка {attempt + 1} ({model_name}): {e}")
+        await asyncio.sleep(1.5)
 
-    # Если ни одна модель не смогла прочитать картинку (например, на ключе только текстовые модели), отвечаем по тексту
     if image_b64:
         return await generate_phil_reply(chat_id, trigger_text, speaker_key=speaker_key, special_task=special_task, image_b64=None)
     return ""
@@ -513,33 +626,68 @@ async def send_human_like_reply(message: Message, reply_text: str):
         return
 
     chat_id = message.chat.id
-    # Проверяем, решил ли Фил прикрепить стикер через тег [СТИКЕР:...]
-    sticker_match = re.search(r"\[СТИКЕР\s*:\s*([^\]]+)\]", reply_text, re.IGNORECASE)
-    chosen_emoji = sticker_match.group(1).strip() if sticker_match else ""
-    clean_text = re.sub(r"\[СТИКЕР\s*:\s*[^\]]+\]", "", reply_text, flags=re.IGNORECASE).strip()
+    messages_since_phil_spoke[chat_id] = 0
 
-    await asyncio.sleep(random.uniform(1.0, 2.0))
+    # Запоминаем собеседника для возможного продолжения «горячего диалога» (на 60 секунд)
+    if message.from_user and not message.from_user.is_bot:
+        active_dialogue[chat_id] = {
+            "user_id": message.from_user.id,
+            "expires": time.time() + 60.0,
+        }
+
+    # Ищем, выбрал ли Фил подходящий по смыслу стикер [СТИКЕР:номер]
+    sticker_match = re.search(r"\[СТИКЕР\s*:\s*#?(\d+)\]", reply_text, re.IGNORECASE)
+    chosen_idx = int(sticker_match.group(1)) if sticker_match else 0
+
+    clean_text = re.sub(r"\[СТИКЕР\s*:\s*[^\]]+\]", "", reply_text, flags=re.IGNORECASE).strip()
+    clean_text = clean_phil_punctuation(clean_text)
+
+    await asyncio.sleep(random.uniform(0.9, 1.8))
 
     if clean_text:
         await bot.send_chat_action(chat_id=chat_id, action="typing")
-        typing_delay = min(3.8, max(1.3, len(clean_text) * 0.04))
+        typing_delay = min(3.5, max(1.2, len(clean_text) * 0.035))
         await asyncio.sleep(typing_delay)
         await message.reply(clean_text)
         chat_history[chat_id].append(f"Фил: {clean_text}")
 
-    # Если ИИ указал тег стикера (или с 18% шансом для живого вайба) — отправляем стикер из базы группы
-    if sticker_match or (random.random() < 0.18 and len(get_group_data(chat_id).get("stickers", [])) > 0):
-        sticker_id = pick_group_sticker(chat_id, chosen_emoji)
+    # Отправляем стикер ТОЛЬКО если ИИ сам подобрал точный номер по смыслу (и не чаще 35% раз, чтобы не надоедать)
+    if chosen_idx > 0 and random.random() < 0.45:
+        sticker_id = get_matching_sticker_by_index(chat_id, chosen_idx)
         if sticker_id:
-            await asyncio.sleep(random.uniform(0.6, 1.4))
+            await asyncio.sleep(random.uniform(0.6, 1.2))
             try:
                 if clean_text:
                     await bot.send_sticker(chat_id=chat_id, sticker=sticker_id)
                 else:
                     await message.reply_sticker(sticker=sticker_id)
-                chat_history[chat_id].append(f"Фил [кинул стикер {chosen_emoji or '😎'}]")
+                chat_history[chat_id].append(f"Фил [кинул стикер #{chosen_idx} в тему]")
             except Exception as e:
                 logging.warning(f"Не удалось отправить стикер: {e}")
+
+
+# --- ПРОВЕРКА: ОБРАЩАЕТСЯ ЛИ ЧЕЛОВЕК К ДРУГОМУ УЧАСТНИКУ ЧАТА ---
+
+def is_talking_to_another_person(message: Message, raw_text: str, bot_id: int, chat_id: int) -> bool:
+    """Проверяет, не пишет ли человек другому кенту, чтобы Фил не влезал невпопад в горячем диалоге."""
+    # 1. Если нажал Reply на сообщение другого человека (не Фила)
+    if message.reply_to_message and message.reply_to_message.from_user:
+        if message.reply_to_message.from_user.id != bot_id:
+            return True
+
+    text_lower = raw_text.lower()
+    # 2. Если в тексте есть чужой @username
+    if "@" in text_lower:
+        return True
+
+    # 3. Если в начале сообщения обращаются по имени к другому участнику из базы группы
+    gdata = get_group_data(chat_id)
+    for user_key in gdata.get("users", {}).keys():
+        clean_name = re.sub(r"\(@.*?\)", "", user_key).strip().lower()
+        if len(clean_name) >= 3 and clean_name in text_lower.split()[:3]:
+            return True
+
+    return False
 
 
 # --- УМНЫЙ ИИ-АССИСТЕНТ ДЛЯ СОЗДАТЕЛЯ В ЛИЧКЕ ---
@@ -562,7 +710,7 @@ async def handle_admin_ai_assistant(message: Message):
 
 ТЕКУЩАЯ БАЗА ПАМЯТИ ГРУППЫ (JSON):
 {json.dumps({k: v for k, v in gdata.items() if k != 'stickers'}, ensure_ascii=False, indent=2)}
-Запомнено стикеров группы: {len(gdata.get('stickers', []))} шт.
+Изучено стикеров со смыслом: {len(gdata.get('stickers', []))} шт.
 
 ПОСЛЕДНИЕ СООБЩЕНИЯ В ГРУППЕ:
 {recent_chat}
@@ -618,7 +766,7 @@ async def handle_admin_ai_assistant(message: Message):
             await save_brain()
 
         if result.get("send_to_group"):
-            msg_to_group = result["send_to_group"]
+            msg_to_group = clean_phil_punctuation(result["send_to_group"])
             await bot.send_message(int(target_cid), msg_to_group)
             chat_history[int(target_cid)].append(f"Фил: {msg_to_group}")
 
@@ -669,8 +817,8 @@ async def admin_panel_cmd(message: Message):
     await message.answer(
         f"🕵️‍♂️ <b>Тайная канцелярия Фила</b>\n"
         f"Модель чата: <code>{CHAT_MODEL}</code>\n"
-        f"Модель фото (Vision): <code>{VISION_MODEL}</code>\n\n"
-        f"Можешь писать мне команды обычным текстом (например: <i>«удали из досье про Лилию, чтобы он этим не спамил»</i>) или жать кнопки:",
+        f"Модель фото/стикеров (Vision): <code>{VISION_MODEL}</code>\n\n"
+        f"Можешь писать мне любые приказы обычным текстом или управлять кнопками:",
         reply_markup=build_groups_keyboard("grp"),
         parse_mode="HTML",
     )
@@ -740,14 +888,15 @@ async def handle_admin_callbacks(call: CallbackQuery):
         users_text = "\n".join([f"• <b>{k}</b>: {v}" for k, v in gdata["users"].items()]) or "Пока пусто"
         memes_text = "\n".join([f"• {m}" for m in gdata["memes"]]) or "Пока пусто"
         slang_text = ", ".join(gdata["slang"]) or "Обычный"
-        stickers_count = len(gdata.get("stickers", []))
+        st_list = gdata.get("stickers", [])
+        stickers_preview = "\n".join([f"#{i+1} {s.get('emoji','')}: {s.get('desc','')}" for i, s in enumerate(st_list[-8:])]) or "Пока нет"
         report = (
             f"📊 <b>Сводка по группе «{title}»</b>\n\n"
             f"<b>Вайб:</b> {gdata['vibe']}\n"
-            f"<b>Сленг:</b> {slang_text}\n"
-            f"<b>Выучено стикеров группы:</b> {stickers_count} шт.\n\n"
+            f"<b>Сленг:</b> {slang_text}\n\n"
             f"👥 <b>Досье на участников:</b>\n{users_text}\n\n"
-            f"🔥 <b>Мемы компании ({len(gdata['memes'])}):</b>\n{memes_text}"
+            f"🔥 <b>Мемы компании ({len(gdata['memes'])}):</b>\n{memes_text}\n\n"
+            f"🎭 <b>Последние изученные стикеры ({len(st_list)} шт.):</b>\n{stickers_preview}"
         )
         await call.message.edit_text(
             report[:4000],
@@ -906,10 +1055,11 @@ async def handle_private_text(message: Message):
                 special_task=f"Напиши в чат сообщение по такому заданию: {text}",
             )
             if reply:
-                await bot.send_message(int(cid), reply)
-                chat_history[int(cid)].append(f"Фил: {reply}")
+                clean_rep = clean_phil_punctuation(reply)
+                await bot.send_message(int(cid), clean_rep)
+                chat_history[int(cid)].append(f"Фил: {clean_rep}")
                 await message.reply(
-                    f"🧠 Фил вбросил в «{gdata['title']}»:\n<i>{reply}</i>",
+                    f"🧠 Фил вбросил в «{gdata['title']}»:\n<i>{clean_rep}</i>",
                     reply_markup=build_group_menu_keyboard(cid),
                     parse_mode="HTML",
                 )
@@ -918,7 +1068,7 @@ async def handle_private_text(message: Message):
     await handle_admin_ai_assistant(message)
 
 
-# --- ОБРАБОТКА СООБЩЕНИЙ, ФОТО И СТИКЕРОВ В ГРУППАХ ---
+# --- ОБРАБОТКА ВСЕХ СОБЫТИЙ В ГРУППАХ ---
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_chat(message: Message):
@@ -930,7 +1080,7 @@ async def handle_group_chat(message: Message):
 
     if not await is_admin_in_group(chat_id):
         try:
-            await message.reply("пацаны, моего бати тут нет, так что ебитесь сами, я ливаю")
+            await message.reply("пацаны моего бати тут нет так что ебитесь сами я ливаю")
             await bot.leave_chat(chat_id)
         except Exception:
             pass
@@ -939,6 +1089,7 @@ async def handle_group_chat(message: Message):
     gdata = get_group_data(chat_id, chat_title)
     last_activity_time[chat_id] = time.time()
     revive_sent[chat_id] = False
+    messages_since_phil_spoke[chat_id] += 1
 
     user_name = message.from_user.first_name or message.from_user.username or "Кент"
     username_tag = f" (@{message.from_user.username})" if message.from_user.username else ""
@@ -951,39 +1102,57 @@ async def handle_group_chat(message: Message):
         and message.reply_to_message.from_user.id == bot_info.id
     )
 
-    # 1. ЕСЛИ КТО-ТО КИНУЛ СТИКЕР В ГРУППУ — ЗАПОМИНАЕМ ЕГО И ИНОГДА ОТВЕЧАЕМ
+    # 1. ОБРАБОТКА ГОЛОСОВЫХ СООБЩЕНИЙ (ВОЙСОВ)
+    if message.voice:
+        dur = message.voice.duration or 0
+        chat_history[chat_id].append(f"{speaker_key} [записал голосовое на {dur} сек.]")
+        if gdata.get("mode") == "silent" or time.time() < muted_until[chat_id]:
+            return
+        if is_reply_to_bot or (dur >= 35 and random.random() < 0.30):
+            task = (
+                f"Собеседник записал голосовое сообщение длительностью {dur} секунд. "
+                f"Подколи его по-пацански (что ты голосовухи не слушаешь, пусть буквами пишет или что он там целый подкаст записал)."
+            )
+            reply = await generate_phil_reply(chat_id, f"[Голосовое {dur} сек.]", speaker_key=speaker_key, special_task=task)
+            await send_human_like_reply(message, reply)
+        return
+
+    # 2. ОБРАБОТКА СТИКЕРОВ (ИЗУЧЕНИЕ СМЫСЛА + ОТВЕТ ПРИ РЕПЛАЕ)
     if message.sticker:
+        last_user_sticker_uid[chat_id] = message.sticker.file_unique_id
         prev_context = ""
         if message.reply_to_message:
             prev_context = message.reply_to_message.text or message.reply_to_message.caption or ""
         elif chat_history[chat_id]:
             prev_context = chat_history[chat_id][-1]
 
-        remember_sticker(chat_id, message.sticker, prev_context)
+        # В фоне изучаем смысл и надпись на стикере через Vision
+        asyncio.create_task(analyze_and_remember_sticker(chat_id, message.sticker, prev_context))
+
         emoji = message.sticker.emoji or "😎"
         chat_history[chat_id].append(f"{speaker_key} [кинул стикер {emoji}]")
 
-        if gdata.get("mode") == "silent":
+        if gdata.get("mode") == "silent" or time.time() < muted_until[chat_id]:
             return
 
-        # Если стикером ответили самому Филу — отвечаем стикером или короткой фразой
-        if is_reply_to_bot and time.time() >= muted_until[chat_id]:
-            if random.random() < 0.65:
-                st_id = pick_group_sticker(chat_id, emoji)
-                if st_id:
-                    await asyncio.sleep(random.uniform(1.0, 2.0))
-                    await message.reply_sticker(sticker=st_id)
-                    return
-            reply = await generate_phil_reply(chat_id, f"[отправил тебе стикер {emoji}]", speaker_key=speaker_key)
+        # Если стикером ответили реплаем Филу — Фил смотрит на стикер через Vision и отвечает по сути!
+        if is_reply_to_bot:
+            img_b64, m_type = await extract_visual_context(message)
+            reply = await generate_phil_reply(
+                chat_id,
+                f"[прислал тебе стикер {emoji}]",
+                speaker_key=speaker_key,
+                image_b64=img_b64,
+                media_type=m_type,
+            )
             await send_human_like_reply(message, reply)
         return
 
-    # 2. ОБРАБОТКА ТЕКСТА И ФОТОГРАФИЙ
+    # 3. ОБРАБОТКА ТЕКСТА, ФОТО, ВИДЕО, КРУЖОЧКОВ И ГИФОК
     raw_text = message.text or message.caption or ""
-    has_photo_in_msg = bool(message.photo)
-    has_photo_in_reply = bool(message.reply_to_message and message.reply_to_message.photo)
+    own_fid, own_media_type = get_visual_file_id_and_type(message)
 
-    if not raw_text and not has_photo_in_msg:
+    if not raw_text and not own_fid:
         return
     if raw_text.startswith("/"):
         return
@@ -996,12 +1165,13 @@ async def handle_group_chat(message: Message):
             else "сообщение"
         )
         r_text = (message.reply_to_message.text or message.reply_to_message.caption or "")[:60]
-        if has_photo_in_reply and not r_text:
-            r_text = "[Фотография]"
+        _, r_media_type = get_visual_file_id_and_type(message.reply_to_message)
+        if r_media_type and not r_text:
+            r_text = f"[{r_media_type}]"
         if r_text:
             reply_context = f" [в ответ {r_user} на «{r_text}»]"
 
-    display_text = f"[Фото] {raw_text}".strip() if has_photo_in_msg else raw_text
+    display_text = f"[{own_media_type}] {raw_text}".strip() if own_media_type else raw_text
     formatted_msg = f"{speaker_key}{reply_context}: {display_text}"
     chat_history[chat_id].append(formatted_msg)
     message_counters[chat_id] += 1
@@ -1014,7 +1184,6 @@ async def handle_group_chat(message: Message):
     if gdata.get("mode") == "silent":
         return
 
-    # Случайная реакция эмодзи
     if random.random() < REACTION_CHANCE:
         try:
             emoji = random.choice(["🤡", "💀", "🔥", "💩", "👍"])
@@ -1027,69 +1196,88 @@ async def handle_group_chat(message: Message):
     words_in_msg = [w.strip(".,!?()\"'") for w in text_lower.split()]
     is_named = any(w.startswith(tuple(BOT_NAMES)) for w in words_in_msg)
 
-    # 3. ПРЯМОЕ ОБРАЩЕНИЕ К ФИЛУ (ТЕКСТОМ ИЛИ С ФОТОГРАФИЕЙ)
-    if is_mentioned or is_reply_to_bot or is_named:
-        now = time.time()
+    # Проверяем, продолжается ли «горячий диалог» с этим же человеком (и не пишет ли он кому-то другому)
+    now = time.time()
+    dialog_state = active_dialogue[chat_id]
+    is_hot_followup = (
+        dialog_state["user_id"] == message.from_user.id
+        and now < dialog_state["expires"]
+        and len(raw_text) > 2
+        and not is_talking_to_another_person(message, raw_text, bot_info.id, chat_id)
+        and random.random() < 0.60
+    )
+
+    # 4. ПРЯМОЕ ОБРАЩЕНИЕ К ФИЛУ ИЛИ ПРОДОЛЖЕНИЕ ГОРЯЧЕГО ДИАЛОГА
+    if is_mentioned or is_reply_to_bot or is_named or is_hot_followup:
         if now < muted_until[chat_id]:
             return
 
+        # На прямой реплай анти-спам мягче, чтобы не обрывать живой диалог
         call_timestamps[chat_id] = [t for t in call_timestamps[chat_id] if now - t < 120]
         call_timestamps[chat_id].append(now)
         if len(call_timestamps[chat_id]) > SPAM_LIMIT_MESSAGES:
-            muted_until[chat_id] = now + 300
-            await message.reply("да отъебитесь вы нахуй, я срать отошёл, через 5 минут буду")
+            muted_until[chat_id] = now + 240
+            await message.reply("да отъебитесь вы нахуй я посрать отошёл через пару минут буду")
             return
 
-        # Если прислали фото или ответили на фото со словом «Фил» — скачиваем картинку для чтения!
-        image_b64 = None
-        if has_photo_in_msg or has_photo_in_reply:
-            image_b64 = await extract_photo_base64(message)
+        image_b64, media_type = await extract_visual_context(message)
 
+        # Спец-триггер 1: Проверка на бота / ИИ («на базе какого ИИ сделан»)
+        if any(w in words_in_msg for w in AI_ACCUSATION_WORDS) or "какого ии" in text_lower:
+            task = (
+                "Собеседник подозревает, что ты ИИ, нейросеть или бот! Высмей это максимально жизненно и с матом: "
+                "скажи что сидишь с телефона, пьешь пиво/чай или чешешь яйца, и подколи его, что ему уже везде роботы мерещатся."
+            )
+            reply = await generate_phil_reply(
+                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64, media_type=media_type
+            )
+            await send_human_like_reply(message, reply)
+            return
+
+        # Спец-триггер 2: Рассуди спор
         if any(kw in text_lower for kw in ["рассуди", "кто прав", "разрули"]):
             task = (
                 "Участники спорят. Прочитай последние сообщения, пойми о чём речь (не путай людей!) "
                 "и по-пацански рассуди: кто тут по факту прав, а кто гонит."
             )
             reply = await generate_phil_reply(
-                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64
+                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64, media_type=media_type
             )
             await send_human_like_reply(message, reply)
             return
 
+        # Спец-триггер 3: Саммари чата
         if any(kw in text_lower for kw in ["че тут было", "чё тут было", "че пропустил", "о чем базар"]):
             task = "Коротко в 2-3 предложениях по-братски перескажи, о чём базарили в чате в последних сообщениях."
             reply = await generate_phil_reply(
-                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64
+                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64, media_type=media_type
             )
             await send_human_like_reply(message, reply)
             return
 
         reply = await generate_phil_reply(
             chat_id,
-            formatted_msg or "Зацени фотку",
+            formatted_msg or f"Зацени ({media_type})",
             speaker_key=speaker_key,
             image_b64=image_b64,
+            media_type=media_type,
         )
         await send_human_like_reply(message, reply)
         return
 
-    # 4. СЛУЧАЙНЫЙ ВРЫВ В РАЗГОВОР (ТЕКСТОМ ИЛИ СТИКЕРОМ ГРУППЫ)
-    if time.time() >= muted_until[chat_id]:
-        # Иногда Фил просто молча кидает стикер группы в тему
-        if len(raw_text) > 8 and random.random() < STICKER_ONLY_CHANCE and gdata.get("stickers"):
-            st_id = pick_group_sticker(chat_id)
-            if st_id:
-                await asyncio.sleep(random.uniform(1.5, 3.0))
-                try:
-                    await message.reply_sticker(sticker=st_id)
-                    chat_history[chat_id].append("Фил [кинул стикер в тему]")
-                    return
-                except Exception:
-                    pass
-
-        if len(raw_text) > 6 and random.random() < RANDOM_REPLY_CHANCE:
-            image_b64 = await extract_photo_base64(message) if has_photo_in_msg else None
-            reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key=speaker_key, image_b64=image_b64)
+    # 5. ГАРАНТИРОВАННЫЙ САМОСТОЯТЕЛЬНЫЙ ВРЫВ ФИЛА В РАЗГОВОР (КАЖДЫЕ 8-12 СООБЩЕНИЙ)
+    if now >= muted_until[chat_id] and messages_since_phil_spoke[chat_id] >= next_auto_intervene[chat_id]:
+        if len(raw_text) > 5 or own_fid:
+            messages_since_phil_spoke[chat_id] = 0
+            next_auto_intervene[chat_id] = random.randint(8, 12)
+            image_b64, media_type = await extract_visual_context(message)
+            task = (
+                "Тебя никто не звал напрямую, но ты читаешь чат и решил сам вставить свои пять копеек "
+                "строго в тему текущего разговора пацанов (коротко, с рофлом или мнением по теме)."
+            )
+            reply = await generate_phil_reply(
+                chat_id, formatted_msg, speaker_key=speaker_key, special_task=task, image_b64=image_b64, media_type=media_type
+            )
             await send_human_like_reply(message, reply)
 
 
@@ -1110,9 +1298,10 @@ async def dead_chat_reviver():
                 )
                 reply = await generate_phil_reply(cid, "Долгое молчание", speaker_key="Чат", special_task=task)
                 if reply:
+                    clean_rep = clean_phil_punctuation(reply)
                     try:
-                        await bot.send_message(cid, reply)
-                        chat_history[cid].append(f"Фил: {reply}")
+                        await bot.send_message(cid, clean_rep)
+                        chat_history[cid].append(f"Фил: {clean_rep}")
                     except Exception as e:
                         logging.warning(f"Не удалось оживить чат {cid}: {e}")
 
@@ -1120,7 +1309,7 @@ async def dead_chat_reviver():
 # --- ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО RENDER ---
 
 async def health_check(request):
-    return web.Response(text="Phil v3 (Vision + Stickers + Vibe Mirror) is alive!")
+    return web.Response(text="Phil v4 (Smart Stickers + No Commas + Vision) is alive!")
 
 
 async def start_web_server():
@@ -1139,7 +1328,7 @@ async def main():
     await load_brain()
     await init_ai_models()
     asyncio.create_task(dead_chat_reviver())
-    logging.info("Фил запущен и готов к базару!")
+    logging.info("Фил v4 запущен и готов к базару!")
     await dp.start_polling(bot)
 
 
