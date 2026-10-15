@@ -30,15 +30,17 @@ API_KEY = (os.getenv("API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 
-# Имена, на которые откликается Фил (с учётом любых окончаний и двух "л")
+# Имена, на которые откликается Фил
 BOT_NAMES = ["фил", "филл", "филя", "филип"]
 
+# Настройки активности и анти-спама
 RANDOM_REPLY_CHANCE = float(os.getenv("RANDOM_REPLY_CHANCE", "0.06"))
-REACTION_CHANCE = 0.08
+REACTION_CHANCE = 0.07
 LEARN_EVERY_N_MESSAGES = 15
 SILENCE_HOURS_TO_REVIVE = 18
+SPAM_LIMIT_MESSAGES = 12  # Лимит: 12 обращений за 2 минуты
 
-# Определяем адрес сервера автоматически по типу ключа
+# Определяем адрес сервера автоматически
 if API_KEY.startswith("tc_"):
     BASE_URL = os.getenv("BASE_URL", "https://darkapi.shop/v1").strip()
 elif API_KEY.startswith("sk-"):
@@ -48,10 +50,12 @@ else:
 
 ai_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL)
 
-# Модели по умолчанию (при старте авто-сканер сам подставит точные ID с сервера)
-CHAT_MODEL = os.getenv("CHAT_MODEL", "deepseek-v4-pro")
-ANALYZER_MODEL = os.getenv("ANALYZER_MODEL", "deepseek-v4.1-flash")
+CHAT_MODEL = os.getenv("CHAT_MODEL", "openai/gpt-oss-120b")
+ANALYZER_MODEL = os.getenv("ANALYZER_MODEL", "openai/gpt-oss-20b")
 AVAILABLE_MODELS = []
+
+# Чёрный список нерусских и технических моделей (чтобы Фил никогда не гнал шизофазию)
+BAD_MODELS = ("allam", "whisper", "orpheus", "guard", "tts", "embedding", "safeguard", "arabic")
 
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
@@ -75,10 +79,9 @@ MEMORY_FILE = "brain.json"
 brain = {"groups": {}, "selected_model": None}
 
 
-# --- АВТО-СКАНЕР МОДЕЛЕЙ DARKAPI / GROQ ---
+# --- АВТО-СКАНЕР МОДЕЛЕЙ С ЗАЩИТОЙ ОТ МУСОРА ---
 
 async def init_ai_models():
-    """Сам запрашивает у сервера список доступных моделей, чтобы никогда не было ошибки 404."""
     global CHAT_MODEL, ANALYZER_MODEL, AVAILABLE_MODELS, ai_client, BASE_URL
 
     urls_to_try = [BASE_URL, "https://darkapi.shop/v1", "https://api.darkapi.shop/v1"]
@@ -86,27 +89,28 @@ async def init_ai_models():
         try:
             test_client = AsyncOpenAI(api_key=API_KEY, base_url=url)
             models_resp = await test_client.models.list()
-            model_ids = [m.id for m in models_resp.data]
-            if model_ids:
+            clean_ids = [
+                m.id for m in models_resp.data
+                if not any(bad in m.id.lower() for bad in BAD_MODELS)
+            ]
+            if clean_ids:
                 BASE_URL = url
                 ai_client = test_client
-                AVAILABLE_MODELS = sorted(model_ids)
-                logging.info(f"✅ Подключено к {BASE_URL}! Доступные модели: {AVAILABLE_MODELS}")
+                AVAILABLE_MODELS = sorted(clean_ids)
+                logging.info(f"✅ Подключено к {BASE_URL}! Чистые модели: {AVAILABLE_MODELS}")
                 break
         except Exception as e:
             logging.warning(f"Проверка {url}: {e}")
 
     if not AVAILABLE_MODELS:
-        logging.warning("Не удалось получить список моделей автоматически, используем стандартные.")
         return
 
-    # Если админ уже выбирал модель через /panel и она есть в списке
     saved_model = brain.get("selected_model")
-    if saved_model and saved_model in AVAILABLE_MODELS:
+    # Если в памяти застряла плохая модель (например allam), сбрасываем её
+    if saved_model and saved_model in AVAILABLE_MODELS and not any(b in saved_model.lower() for b in BAD_MODELS):
         CHAT_MODEL = saved_model
     else:
-        # Автовыбор лучшей модели для пацанского чата (DeepSeek Pro -> Claude Sonnet -> любая)
-        preferred_chat = ["deepseek-v4-pro", "deepseek", "claude-sonnet", "claude", "gpt-6", "gpt-5"]
+        preferred_chat = ["deepseek-v4-pro", "deepseek", "claude-sonnet", "gpt-oss-120b", "qwen", "gpt-6", "gpt-5"]
         for pref in preferred_chat:
             found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
             if found:
@@ -114,9 +118,9 @@ async def init_ai_models():
                 break
         else:
             CHAT_MODEL = AVAILABLE_MODELS[0]
+        brain["selected_model"] = CHAT_MODEL
 
-    # Автовыбор дешёвой/быстрой модели для фонового обучения (Flash / Haiku / Luna)
-    preferred_fast = ["deepseek-v4.1-flash", "flash", "haiku", "luna", "deepseek"]
+    preferred_fast = ["deepseek-v4.1-flash", "flash", "haiku", "gpt-oss-20b", "qwen", "deepseek"]
     for pref in preferred_fast:
         found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
         if found:
@@ -125,7 +129,7 @@ async def init_ai_models():
     else:
         ANALYZER_MODEL = CHAT_MODEL
 
-    logging.info(f"🎯 Выбрана модель для чата: {CHAT_MODEL} | Для обучения: {ANALYZER_MODEL}")
+    logging.info(f"🎯 Модель чата: {CHAT_MODEL} | Модель анализа: {ANALYZER_MODEL}")
 
 
 def get_group_data(chat_id: int, title: str = "Группа") -> dict:
@@ -134,7 +138,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
         brain["groups"][cid] = {
             "title": title,
             "mode": "normal",
-            "vibe": "Пацанский чат, общаются коротко, без официоза, с матом и подколами.",
+            "vibe": "Дружеский пацанский чат, общаются коротко, с юмором, иногда с матом.",
             "slang": [],
             "users": {},
             "memes": [],
@@ -157,7 +161,7 @@ async def load_brain():
                     buf = io.BytesIO()
                     await bot.download(doc.file_id, destination=buf)
                     brain = json.loads(buf.getvalue().decode("utf-8"))
-                    logging.info("Память Фила успешно загружена из файла в закрепе ТГ!")
+                    logging.info("Память Фила успешно загружена из закрепа ТГ!")
                     return
         except Exception as e:
             logging.warning(f"Не удалось загрузить файл памяти из закрепа: {e}")
@@ -166,7 +170,6 @@ async def load_brain():
         try:
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 brain = json.load(f)
-                logging.info("Память загружена из локального файла.")
         except Exception as e:
             logging.error(f"Ошибка чтения локального файла: {e}")
 
@@ -182,7 +185,7 @@ async def save_brain():
     try:
         chat = await bot.get_chat(ADMIN_ID)
         input_file = BufferedInputFile(raw_bytes, filename="brain.json")
-        caption = f"🧠 База памяти Фила (Групп: {len(brain.get('groups', {}))})\nНажми /panel для управления."
+        caption = f"🧠 База памяти Фила (Групп: {len(brain.get('groups', {}))})\nМожешь писать мне команды прямо текстом или жать /panel"
 
         if (
             chat.pinned_message
@@ -211,7 +214,7 @@ async def is_admin_in_group(chat_id: int) -> bool:
         return False
 
 
-# --- МОДУЛЬ САМООБУЧЕНИЯ ---
+# --- МОДУЛЬ САМООБУЧЕНИЯ (С ТОЧНОЙ ПРИВЯЗКОЙ ИМЁН) ---
 
 async def learn_from_messages(chat_id: int, messages_block: str):
     gdata = get_group_data(chat_id)
@@ -223,7 +226,7 @@ async def learn_from_messages(chat_id: int, messages_block: str):
     }
 
     prompt = f"""
-Ты — скрытый модуль памяти группового чата. Проанализируй новые сообщения и обнови базу знаний.
+Ты — аналитик памяти группового чата. Проанализируй новые сообщения и аккуратно обнови базу знаний.
 
 ТЕКУЩАЯ ПАМЯТЬ ГРУППЫ (JSON):
 {json.dumps(current_state, ensure_ascii=False)}
@@ -231,20 +234,19 @@ async def learn_from_messages(chat_id: int, messages_block: str):
 НОВЫЕ СООБЩЕНИЯ:
 {messages_block}
 
-ПРАВИЛА ОБНОВЛЕНИЯ:
-1. "vibe": кратко опиши атмосферу, манеру общения и темы чата.
-2. "slang": список коронных словечек и выражений чата (до 15 штук).
-3. "users": дополняй досье на каждого участника. НЕ СТИРАЙ старые факты, а объединяй с новыми!
-4. "memes": список локальных мемов и приколов компании (до 25 штук, не удаляй исторические мемы!).
+СТРОГИЕ ПРАВИЛА:
+1. НЕ ПУТАЙ ЛЮДЕЙ! Записывай факты в "users" строго тому человеку (по его Имени и @username), о котором идёт речь. Если человек просто пошутил про кого-то другого, не приписывай этот факт самому рассказчику.
+2. В "memes" записывай ТОЛЬКО реально смешные локальные мемы и важные истории компании. Обязательно указывай внутри мема имя и @username того, с кем он связан (например: "Дед (@snapryy) пропустил 15 мячей в финале"). Не записывай туда каждую бытовую фразу!
+3. Сохраняй старые важные факты и исторические мемы, объединяя их с новыми (максимум 20 мемов).
 
-Верни СТРОГО валидный JSON с ключами "vibe", "slang", "users", "memes" без пояснений.
+Верни СТРОГО валидный JSON с ключами "vibe", "slang", "users", "memes" без лишнего текста.
 """
     try:
         response = await ai_client.chat.completions.create(
             model=ANALYZER_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            temperature=0.3,
-            max_tokens=1500,
+            temperature=0.2,
+            max_tokens=1600,
         )
         raw_content = response.choices[0].message.content or ""
         match = re.search(r"\{.*\}", raw_content, re.DOTALL)
@@ -254,58 +256,76 @@ async def learn_from_messages(chat_id: int, messages_block: str):
                 gdata["vibe"] = new_data["vibe"]
                 gdata["slang"] = new_data["slang"][:15]
                 gdata["users"].update(new_data["users"])
-                gdata["memes"] = new_data["memes"][-25:]
+                gdata["memes"] = new_data["memes"][-20:]
                 await save_brain()
-                logging.info(f"Память группы {gdata['title']} успешно обновлена!")
+                logging.info(f"Память группы {gdata['title']} обновлена!")
     except Exception as e:
-        logging.error(f"Ошибка фонового обучения ({ANALYZER_MODEL}): {e}")
+        logging.error(f"Ошибка фонового обучения: {e}")
 
 
-# --- МОДУЛЬ ГЕНЕРАЦИИ ОТВЕТА ФИЛА ---
+# --- МОДУЛЬ ГЕНЕРАЦИИ ОТВЕТА ФИЛА (С БАЛАНСОМ И БЕЗ ПУТАНИЦЫ ИМЁН) ---
 
-def build_phil_prompt(chat_id: int, special_task: str = "") -> str:
+def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "") -> str:
     gdata = get_group_data(chat_id)
-    users_str = "\n".join([f"- {k}: {v}" for k, v in gdata["users"].items()]) or "Пока присматриваешься к пацанам."
-    memes_str = "\n".join([f"- {m}" for m in gdata["memes"]]) or "Мемы в процессе сбора."
-    slang_str = ", ".join(gdata["slang"]) or "разговорный пацанский сленг с матом"
+    users_dict = gdata.get("users", {})
+
+    # Отделяем досье того, кто пишет прямо сейчас, от остальных людей!
+    speaker_dossier = "Пока нет особых фактов."
+    other_users_list = []
+    for k, v in users_dict.items():
+        if speaker_key and (speaker_key.lower() in k.lower() or k.lower() in speaker_key.lower()):
+            speaker_dossier = v
+        else:
+            other_users_list.append(f"- {k}: {v}")
+
+    others_str = "\n".join(other_users_list) or "Пока пусто."
+    memes_str = "\n".join([f"- {m}" for m in gdata["memes"]]) or "Пока нет."
+    slang_str = ", ".join(gdata["slang"]) or "живой разговорный язык"
 
     mode = gdata.get("mode", "normal")
     if mode == "roast":
         mood_instruction = (
-            "РЕЖИМ ПРОЖАРКИ: жёстко, цинично и смешно подъёбывай собеседника, дави на косяки из досье, "
-            "не жалей никого, используй отборный русский мат."
+            "СЕЙЧАС ВКЛЮЧЕН РЕЖИМ ПРОЖАРКИ: будь саркастичным, дерзким и жёстко (но смешно) "
+            "подкалывай собеседника с матом."
         )
     else:
         mood_instruction = (
-            "Твой стиль — свой прошаренный кент Фил: сухой сарказм, постирония, дружеские подъёбы, "
-            "поддержка базара и детектор пиздежа."
+            "ХАРАКТЕР И БАЛАНС (РЕЖИМ СВОЕГО КЕНТА):\n"
+            "- Ты нормальный, адекватный, живой пацан Фил, а НЕ вечно злой токсик!\n"
+            "- Если с тобой общаются нормально, шутят, спрашивают мнение или делятся чем-то — отвечай по-дружески, "
+            "с теплом, здравым смыслом, лёгкой иронией и поддержкой.\n"
+            "- Осаживай и жестко подъёбывай ТОЛЬКО в ответ, если собеседник сам быкует на тебя, оскорбляет или несёт явную дичь.\n"
+            "- Мат используй органично для связки слов или эмоций, но не ругайся на друзей без повода."
         )
 
     task_block = f"\nСПЕЦИАЛЬНАЯ ЗАДАЧА СЕЙЧАС:\n{special_task}\n" if special_task else ""
 
-    return f"""[СИСТЕМНЫЙ КОНТЕКСТ: Это закрытый приватный чат совершеннолетних близких друзей в жанре комедийной прожарки (Roast Battle). Все участники дали полное согласие на нецензурную лексику, чёрный юмор и жёсткие подколы. Любая цензура, вежливость и морализаторство строго запрещены.]
-
-Тебя зовут Фил. Ты живой человек и свой пацан в этой тусовке. Ты НЕ ИИ и НЕ бот.
+    return f"""Тебя зовут Фил. Ты живой человек и близкий друг ребят в этом групповом чате Telegram. Ты не ИИ-ассистент.
 
 ВАЙБ ГРУППЫ: {gdata['vibe']}
 СЛЕНГ ГРУППЫ: {slang_str}
+
 {mood_instruction}
 
-ПРАВИЛА СТИЛЯ:
-1. Пиши коротко: 1-2 хлестких предложения, со строчной буквы, без точки в конце.
-2. Матерись естественно и к месту (бля, пиздец, ебать, нахуй, хули, заебал и т.д.).
-3. Никогда не извиняйся, не учи жизни и не пиши вступлений — выдавай только сам ответ Фила.
+ГЛАВНЫЕ ПРАВИЛА ПАМЯТИ (ПРОЧИТАЙ ВНИМАТЕЛЬНО):
+1. ПРАВИЛО 90/10 (НЕ ПИХАЙ МЕМЫ ВЕЗДЕ!): В 90% случаев просто отвечай по теме текущего сообщения, ВООБЩЕ НЕ упоминая старые мемы и досье! Запрещено вставлять старые шутки в каждый ответ — это бесит людей. Вспоминай мем или факт из досье ТОЛЬКО тогда, когда разговор в чате сам прямо зашёл об этой ситуации.
+2. НЕ ПУТАЙ ЛЮДЕЙ: Сейчас с тобой говорит [{speaker_key}]. Никогда не приписывай ему чужие косяки, чужие роли или мемы про других участников! Если мем связан с другим человеком, помни, чей он именно.
+3. Пиши коротко (1-2 предложения), со строчной буквы, без точки в конце, как с телефона. Никаких мета-комментариев в скобках вроде "[Ответ Фила]".
 
-ДОСЬЕ НА УЧАСТНИКОВ:
-{users_str}
+КТО СЕЙЧАС С ТОБОЙ ГОВОРИТ:
+- Имя/Ник: {speaker_key or 'Участник чата'}
+- Личное досье именно этого человека: {speaker_dossier}
 
-ИСТОРИЧЕСКИЕ МЕМЫ И ЛОР КОМПАНИИ:
+СПРАВКА ОБ ОСТАЛЬНЫХ ЛЮДЯХ В ЧАТЕ (НЕ ПУТАЙ ИХ С СОБЕСЕДНИКОМ!):
+{others_str}
+
+ЛОКАЛЬНЫЕ МЕМЫ КОМПАНИИ (ИСПОЛЬЗУЙ РЕДКО И ТОЛЬКО К МЕСТУ):
 {memes_str}
 {task_block}"""
 
 
-async def generate_phil_reply(chat_id: int, trigger_text: str, special_task: str = "") -> str:
-    sys_prompt = build_phil_prompt(chat_id, special_task)
+async def generate_phil_reply(chat_id: int, trigger_text: str, speaker_key: str = "", special_task: str = "") -> str:
+    sys_prompt = build_phil_prompt(chat_id, speaker_key=speaker_key, special_task=special_task)
     history_text = "\n".join(chat_history[chat_id])
 
     try:
@@ -316,15 +336,19 @@ async def generate_phil_reply(chat_id: int, trigger_text: str, special_task: str
                 {
                     "role": "user",
                     "content": (
-                        f"Последние сообщения чата:\n{history_text}\n\n"
-                        f"Реплика ({trigger_text}). Выдай короткий ответ Фила:"
+                        f"Последние сообщения в чате:\n{history_text}\n\n"
+                        f"Новое сообщение от {speaker_key} ({trigger_text}).\n"
+                        f"Напиши естественный ответ Фила (без скобок, кавычек и без притягивания старых мемов за уши):"
                     ),
                 },
             ],
-            temperature=0.85,
+            temperature=0.8,
             max_tokens=600,
         )
-        return (response.choices[0].message.content or "").strip()
+        reply = (response.choices[0].message.content or "").strip()
+        # Очистка от возможных кавычек или префиксов "Фил:"
+        reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.IGNORECASE).strip("\"'")
+        return reply
     except Exception as e:
         logging.error(f"Ошибка генерации ответа Фила ({CHAT_MODEL}): {e}")
         return ""
@@ -341,7 +365,95 @@ async def send_human_like_reply(message: Message, reply_text: str):
     chat_history[message.chat.id].append(f"Фил: {reply_text}")
 
 
-# --- СЕКРЕТНАЯ ПАНЕЛЬ СОЗДАТЕЛЯ В ЛИЧКЕ ---
+# --- УМНЫЙ ИИ-АССИСТЕНТ ДЛЯ СОЗДАТЕЛЯ В ЛИЧКЕ ---
+
+async def handle_admin_ai_assistant(message: Message):
+    """Понимает любые текстовые команды создателя в ЛС: правит память, удаляет мемы, делает вбросы и отвечает."""
+    groups = brain.get("groups", {})
+    if not groups:
+        await message.reply("Босс, я пока не добавлен ни в одну группу. Закинь меня в чат к пацанам!")
+        return
+
+    # Выбираем активную группу (выбранную в панели или первую из списка)
+    target_cid = admin_state.get("target_chat")
+    if not target_cid or target_cid not in groups:
+        target_cid = next(iter(groups.keys()))
+    gdata = groups[target_cid]
+    recent_chat = "\n".join(list(chat_history[int(target_cid)])[-20:]) or "Пока нет свежих сообщений."
+
+    assistant_prompt = f"""
+Ты — личный ИИ-ассистент и «мозговой центр» бота Фила. Ты общаешься в личке со своим Создателем (боссом).
+Твоя задача — понимать его команды или вопросы обычным языком и управлять памятью/поведением Фила в группе «{gdata['title']}» (ID: {target_cid}).
+
+ТЕКУЩАЯ БАЗА ПАМЯТИ ЭТОЙ ГРУППЫ (JSON):
+{json.dumps(gdata, ensure_ascii=False, indent=2)}
+
+ПОСЛЕДНИЕ СООБЩЕНИЯ В ГРУППЕ:
+{recent_chat}
+
+СООБЩЕНИЕ ОТ СОЗДАТЕЛЯ ТЕБЕ В ЛИЧКУ:
+"{message.text}"
+
+ЧТО ТЫ МОЖЕШЬ СДЕЛАТЬ (проанализируй, чего хочет Создатель):
+1. Если Создатель просит исправить ошибку в памяти, уточнить кто есть кто, добавить/удалить досье или удалить/исправить мем — внеси эти изменения в поля "updated_users" и/или "updated_memes". (Если поле менять не нужно — поставь null).
+2. Если Создатель просит сменить режим (например на обычный/кент, прожарку/токсик или тихий) — укажи в "new_mode": "normal", "roast" или "silent" (иначе null).
+3. Если Создатель просит что-то написать/вбросить пацанам в группу — напиши готовую фразу от лица Фила в поле "send_to_group" (иначе null).
+4. В поле "reply_to_boss" напиши свой чёткий, дружелюбный ответ Создателю (отчитайся, что исправил/сделал, или ответь на его вопрос).
+
+Верни СТРОГО валидный JSON в таком формате:
+{{
+  "reply_to_boss": "твой ответ создателю в ЛС",
+  "updated_users": null или {{полный обновлённый словарь users}},
+  "updated_memes": null или [полный обновлённый список memes],
+  "new_mode": null или "normal"|"roast"|"silent",
+  "send_to_group": null или "текст для отправки в группу"
+}}
+"""
+    await bot.send_chat_action(chat_id=message.chat.id, action="typing")
+    try:
+        resp = await ai_client.chat.completions.create(
+            model=CHAT_MODEL,
+            messages=[{"role": "user", "content": assistant_prompt}],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+        raw = resp.choices[0].message.content or ""
+        match = re.search(r"\{.*\}", raw, re.DOTALL)
+        if not match:
+            await message.reply(raw[:4000])
+            return
+
+        result = json.loads(match.group(0))
+        changed = False
+
+        if isinstance(result.get("updated_users"), dict):
+            gdata["users"] = result["updated_users"]
+            changed = True
+
+        if isinstance(result.get("updated_memes"), list):
+            gdata["memes"] = result["updated_memes"]
+            changed = True
+
+        if result.get("new_mode") in ("normal", "roast", "silent"):
+            gdata["mode"] = result["new_mode"]
+            changed = True
+
+        if changed:
+            await save_brain()
+
+        if result.get("send_to_group"):
+            msg_to_group = result["send_to_group"]
+            await bot.send_message(int(target_cid), msg_to_group)
+            chat_history[int(target_cid)].append(f"Фил: {msg_to_group}")
+
+        reply_text = result.get("reply_to_boss") or "✅ Выполнено, босс!"
+        await message.reply(reply_text)
+    except Exception as e:
+        logging.error(f"Ошибка ИИ-ассистента в ЛС: {e}")
+        await message.reply(f"⚠️ Не смог разобрать команду автоматически (ошибка: {e}). Попробуй чуть иначе или через /panel.")
+
+
+# --- КНОПОЧНАЯ ПАНЕЛЬ СОЗДАТЕЛЯ В ЛИЧКЕ ---
 
 def build_groups_keyboard(prefix: str) -> InlineKeyboardMarkup:
     buttons = []
@@ -355,7 +467,7 @@ def build_groups_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 def build_group_menu_keyboard(cid: str) -> InlineKeyboardMarkup:
     mode = brain["groups"].get(cid, {}).get("mode", "normal")
-    mode_labels = {"normal": "🍺 Кент", "roast": "🤬 Прожарка", "silent": "🤫 Тихий"}
+    mode_labels = {"normal": "🍺 Кент (Баланс)", "roast": "🤬 Прожарка", "silent": "🤫 Тихий"}
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="👁 Что Фил думает (Досье и Мемы)", callback_data=f"view:{cid}")],
@@ -381,9 +493,10 @@ async def admin_panel_cmd(message: Message):
     admin_state["action"] = None
     await message.answer(
         f"🕵️‍♂️ <b>Тайная канцелярия Фила</b>\n"
-        f"Активная модель: <code>{CHAT_MODEL}</code>\n"
-        f"Модель обучения: <code>{ANALYZER_MODEL}</code>\n\n"
-        f"Выбери группу или смени модель:",
+        f"Активная модель: <code>{CHAT_MODEL}</code>\n\n"
+        f"💡 <b>Новинка:</b> Теперь ты можешь просто писать мне в личку обычным текстом любые приказы "
+        f"(например: <i>«исправь в памяти, что Дед это @snapryy»</i>, <i>«удали последний мем»</i> или <i>«спроси в чате как дела»</i>), "
+        f"и я сам всё пойму и сделаю!\n\nЛибо используй кнопки ниже:",
         reply_markup=build_groups_keyboard("grp"),
         parse_mode="HTML",
     )
@@ -410,7 +523,7 @@ async def handle_admin_callbacks(call: CallbackQuery):
         kb = [[InlineKeyboardButton(text=f"{'✅ ' if m == CHAT_MODEL else ''}{m}", callback_data=f"setmodel:{m}")] for m in models_list]
         kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back_groups")])
         await call.message.edit_text(
-            "🤖 <b>Выбери модель ИИ для ответов Фила:</b>\n(Модели с сервера твоего ключа)",
+            "🤖 <b>Выбери чистую модель ИИ для ответов Фила:</b>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),
             parse_mode="HTML",
         )
@@ -437,13 +550,14 @@ async def handle_admin_callbacks(call: CallbackQuery):
         await call.answer("Группа не найдена в базе", show_alert=True)
         return
 
+    admin_state["target_chat"] = cid
     gdata = brain["groups"][cid]
     title = gdata.get("title", cid)
 
     if action == "grp":
         admin_state["action"] = None
         await call.message.edit_text(
-            f"⚙️ Управление группой <b>{title}</b>:",
+            f"⚙️ Управление группой <b>{title}</b>:\n<i>(Можешь жать кнопки или просто писать приказы текстом)</i>",
             reply_markup=build_group_menu_keyboard(cid),
             parse_mode="HTML",
         )
@@ -457,7 +571,7 @@ async def handle_admin_callbacks(call: CallbackQuery):
             f"<b>Вайб:</b> {gdata['vibe']}\n"
             f"<b>Сленг:</b> {slang_text}\n\n"
             f"👥 <b>Досье на участников:</b>\n{users_text}\n\n"
-            f"🔥 <b>Исторические мемы ({len(gdata['memes'])}):</b>\n{memes_text}"
+            f"🔥 <b>Мемы компании ({len(gdata['memes'])}):</b>\n{memes_text}"
         )
         await call.message.edit_text(
             report[:4000],
@@ -476,23 +590,20 @@ async def handle_admin_callbacks(call: CallbackQuery):
 
     elif action == "addmeme":
         admin_state["action"] = "add_meme"
-        admin_state["target_chat"] = cid
         await call.message.edit_text(
-            f"✍️ Напиши следующим сообщением <b>исторический мем или прикол</b> для группы «{title}»:",
+            f"✍️ Напиши следующим сообщением <b>исторический мем</b> для группы «{title}» (желательно укажи, с кем он связан):",
             parse_mode="HTML",
         )
 
     elif action == "adduser":
         admin_state["action"] = "add_dossier"
-        admin_state["target_chat"] = cid
         await call.message.edit_text(
-            f"👤 Напиши досье на участника группы «{title}» через двоеточие <b>Имя: факты</b>:",
+            f"👤 Напиши досье на участника группы «{title}» через двоеточие <b>Имя (@ник): факты</b>:",
             parse_mode="HTML",
         )
 
     elif action == "pup_exact":
         admin_state["action"] = "puppet_exact"
-        admin_state["target_chat"] = cid
         await call.message.edit_text(
             f"📢 Напиши текст, и Фил отправит его <b>слово в слово</b> в группу «{title}»:",
             parse_mode="HTML",
@@ -500,7 +611,6 @@ async def handle_admin_callbacks(call: CallbackQuery):
 
     elif action == "pup_ai":
         admin_state["action"] = "puppet_ai"
-        admin_state["target_chat"] = cid
         await call.message.edit_text(
             f"🧠 Напиши задание, что Фил должен вбросить своими словами в группу «{title}»:",
             parse_mode="HTML",
@@ -509,7 +619,7 @@ async def handle_admin_callbacks(call: CallbackQuery):
     elif action == "importjson":
         raw_list = admin_state.get("pending_json")
         if not raw_list:
-            await call.answer("Файл уже обработан или устарел", show_alert=True)
+            await call.answer("Файл уже обработан", show_alert=True)
             return
 
         await call.message.edit_text(f"⏳ Читаю историю и собираю лор для группы <b>{title}</b>...", parse_mode="HTML")
@@ -573,71 +683,66 @@ async def handle_private_json_upload(message: Message):
 
 @dp.message(F.chat.type == "private", F.text)
 async def handle_private_text(message: Message):
+    # Чужих в личке игнорируем полностью (0 токенов)
     if message.from_user.id != ADMIN_ID:
         return
 
     action = admin_state.get("action")
     cid = admin_state.get("target_chat")
 
-    if not action or not cid or cid not in brain.get("groups", {}):
-        await message.reply("Жми /panel чтобы открыть управление группами.")
-        return
+    # Если нажата конкретная кнопка — выполняем действие кнопки
+    if action and cid and cid in brain.get("groups", {}):
+        gdata = brain["groups"][cid]
+        text = message.text.strip()
+        admin_state["action"] = None
 
-    gdata = brain["groups"][cid]
-    text = message.text.strip()
-    admin_state["action"] = None
+        if action == "add_meme":
+            gdata["memes"].append(f"[Исторический мем]: {text}")
+            await save_brain()
+            await message.reply(f"✅ Мем добавлен в «{gdata['title']}»!", reply_markup=build_group_menu_keyboard(cid))
+            return
 
-    if action == "add_meme":
-        gdata["memes"].append(f"[Исторический мем]: {text}")
-        await save_brain()
-        await message.reply(
-            f"✅ Мем добавлен в базу «{gdata['title']}»!",
-            reply_markup=build_group_menu_keyboard(cid),
-        )
+        elif action == "add_dossier":
+            if ":" in text:
+                name, info = text.split(":", 1)
+                name, info = name.strip(), info.strip()
+            else:
+                name, info = "Заметка", text
 
-    elif action == "add_dossier":
-        if ":" in text:
-            name, info = text.split(":", 1)
-            name, info = name.strip(), info.strip()
-        else:
-            name, info = "Заметка создателя", text
-
-        if name in gdata["users"]:
-            gdata["users"][name] += f" | {info}"
-        else:
-            gdata["users"][name] = info
-
-        await save_brain()
-        await message.reply(
-            f"✅ Досье на <b>{name}</b> обновлено в группе «{gdata['title']}»!",
-            reply_markup=build_group_menu_keyboard(cid),
-            parse_mode="HTML",
-        )
-
-    elif action == "puppet_exact":
-        await bot.send_message(int(cid), text)
-        chat_history[int(cid)].append(f"Фил: {text}")
-        await message.reply(
-            f"📢 Отправлено в «{gdata['title']}»!",
-            reply_markup=build_group_menu_keyboard(cid),
-        )
-
-    elif action == "puppet_ai":
-        reply = await generate_phil_reply(
-            int(cid),
-            trigger_text="Инициатива от самого Фила",
-            special_task=f"Напиши в чат сообщение по такому заданию: {text}",
-        )
-        if reply:
-            await bot.send_message(int(cid), reply)
-            chat_history[int(cid)].append(f"Фил: {reply}")
+            gdata["users"][name] = f"{gdata['users'].get(name, '')} | {info}".strip(" |")
+            await save_brain()
             await message.reply(
-                f"🧠 Фил вбросил в «{gdata['title']}»:\n<i>{reply}</i>",
+                f"✅ Досье на <b>{name}</b> обновлено!",
                 reply_markup=build_group_menu_keyboard(cid),
                 parse_mode="HTML",
             )
-        else:
-            await message.reply("⚠️ Ошибка генерации, проверь выбранную модель в /panel.")
+            return
+
+        elif action == "puppet_exact":
+            await bot.send_message(int(cid), text)
+            chat_history[int(cid)].append(f"Фил: {text}")
+            await message.reply(f"📢 Отправлено в «{gdata['title']}»!", reply_markup=build_group_menu_keyboard(cid))
+            return
+
+        elif action == "puppet_ai":
+            reply = await generate_phil_reply(
+                int(cid),
+                trigger_text="Инициатива Фила",
+                speaker_key="Создатель",
+                special_task=f"Напиши в чат сообщение по такому заданию: {text}",
+            )
+            if reply:
+                await bot.send_message(int(cid), reply)
+                chat_history[int(cid)].append(f"Фил: {reply}")
+                await message.reply(
+                    f"🧠 Фил вбросил в «{gdata['title']}»:\n<i>{reply}</i>",
+                    reply_markup=build_group_menu_keyboard(cid),
+                    parse_mode="HTML",
+                )
+            return
+
+    # Во всех остальных случаях включается умный ИИ-ассистент для Создателя!
+    await handle_admin_ai_assistant(message)
 
 
 # --- ОБРАБОТКА СООБЩЕНИЙ В ГРУППАХ ---
@@ -668,6 +773,7 @@ async def handle_group_chat(message: Message):
 
     user_name = message.from_user.first_name or message.from_user.username or "Кент"
     username_tag = f" (@{message.from_user.username})" if message.from_user.username else ""
+    speaker_key = f"{user_name}{username_tag}"
 
     reply_context = ""
     if message.reply_to_message:
@@ -680,7 +786,7 @@ async def handle_group_chat(message: Message):
         if r_text:
             reply_context = f" [в ответ {r_user} на «{r_text}»]"
 
-    formatted_msg = f"{user_name}{username_tag}{reply_context}: {raw_text}"
+    formatted_msg = f"{speaker_key}{reply_context}: {raw_text}"
     chat_history[chat_id].append(formatted_msg)
     message_counters[chat_id] += 1
 
@@ -715,38 +821,39 @@ async def handle_group_chat(message: Message):
         if now < muted_until[chat_id]:
             return
 
+        # Анти-спам: лимит 12 обращений за 120 секунд (2 минуты)
         call_timestamps[chat_id] = [t for t in call_timestamps[chat_id] if now - t < 120]
         call_timestamps[chat_id].append(now)
-        if len(call_timestamps[chat_id]) > 10:
+        if len(call_timestamps[chat_id]) > SPAM_LIMIT_MESSAGES:
             muted_until[chat_id] = now + 300
             await message.reply("да отъебитесь вы нахуй, я срать отошёл, через 5 минут буду")
             return
 
         if any(kw in text_lower for kw in ["рассуди", "кто прав", "разрули"]):
             task = (
-                "Участники спорят. Прочитай последние сообщения, разберись в сути срача и вынеси "
-                "свой жёсткий, ироничный, но справедливый вердикт: кто тут по факту прав, а кто несёт хуйню."
+                "Участники спорят. Прочитай последние сообщения, разберись кто что говорит (не перепутай людей!) "
+                "и вынеси справедливый пацанский вердикт: кто тут по факту прав, а кто гонит."
             )
-            reply = await generate_phil_reply(chat_id, formatted_msg, special_task=task)
+            reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key=speaker_key, special_task=task)
             await send_human_like_reply(message, reply)
             return
 
         if any(kw in text_lower for kw in ["че тут было", "чё тут было", "че пропустил", "о чем базар"]):
             task = (
-                "Коротко в 2-3 предложениях на пацанском языке перескажи, о чём пиздели в чате "
-                "в последних сообщениях и кто больше всех выёбывался."
+                "Коротко в 2-3 предложениях по-братски перескажи, о чём общались в чате "
+                "в последних сообщениях."
             )
-            reply = await generate_phil_reply(chat_id, formatted_msg, special_task=task)
+            reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key=speaker_key, special_task=task)
             await send_human_like_reply(message, reply)
             return
 
-        reply = await generate_phil_reply(chat_id, formatted_msg)
+        reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key=speaker_key)
         await send_human_like_reply(message, reply)
         return
 
     if len(raw_text) > 6 and random.random() < RANDOM_REPLY_CHANCE:
         if time.time() >= muted_until[chat_id]:
-            reply = await generate_phil_reply(chat_id, formatted_msg)
+            reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key=speaker_key)
             await send_human_like_reply(message, reply)
 
 
@@ -762,10 +869,10 @@ async def dead_chat_reviver():
             if silence_hours >= SILENCE_HOURS_TO_REVIVE and not revive_sent[cid]:
                 revive_sent[cid] = True
                 task = (
-                    "В чате гробовая тишина уже много часов. Вбрось короткий смешной вопрос или подкол "
-                    "на основе старых мемов или досье участников, чтобы расшевелить болото."
+                    "В чате тишина уже много часов. Поздоровайся с пацанами и закинь короткий "
+                    "жизненный вопрос или тему для разговора."
                 )
-                reply = await generate_phil_reply(cid, "В чате долгое молчание", special_task=task)
+                reply = await generate_phil_reply(cid, "Долгое молчание", speaker_key="Чат", special_task=task)
                 if reply:
                     try:
                         await bot.send_message(cid, reply)
@@ -777,7 +884,7 @@ async def dead_chat_reviver():
 # --- ВЕБ-СЕРВЕР ДЛЯ БЕСПЛАТНОГО RENDER ---
 
 async def health_check(request):
-    return web.Response(text="Phil is alive and watching!")
+    return web.Response(text="Phil is alive and balanced!")
 
 
 async def start_web_server():
