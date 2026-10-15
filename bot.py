@@ -717,7 +717,7 @@ async def handle_group_chat(message: Message):
 
         call_timestamps[chat_id] = [t for t in call_timestamps[chat_id] if now - t < 120]
         call_timestamps[chat_id].append(now)
-        if len(call_timestamps[chat_id]) > 4:
+        if len(call_timestamps[chat_id]) > 10:
             muted_until[chat_id] = now + 300
             await message.reply("да отъебитесь вы нахуй, я срать отошёл, через 5 минут буду")
             return
