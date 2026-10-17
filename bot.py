@@ -592,6 +592,9 @@ def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "
 - Длина разная: иногда 2-4 слова, чаще одна фраза, редко две-три. Без списков, морали и объяснений.
 - Пиши как с телефона: строчными, без точки в конце, без тире и кавычек, можно "чё, щас, хз, ваще, норм".
 - Сегодня {datetime.now().strftime('%d.%m.%Y')}. Свежие новости и факты ты сам не знаешь: если в ЗАДАЧЕ есть данные из интернета, опирайся на них, а если данных нет и ты не уверен, так и скажи ("хз, не следил"). Цифры, счёт и даты не выдумывай.
+- Ты не видишь трансляций. Счёт, кто забил, составы и ход матча бери ТОЛЬКО из сообщений чата выше или из данных в ЗАДАЧЕ. Если там этого нет, скажи "хз че там, какой счёт?", но не придумывай.
+- Пиши простыми словами, как в мессенджере. Не строй красивых фраз и метафор ("подвиг над", "интрига про"): если не можешь объяснить смысл своей фразы, перепиши проще.
+- Отвечай именно на последнее сообщение и держись темы, о которой сейчас говорят в чате. Не тащи в ответ посторонние факты.
 - Элементарные вещи (история, мировые войны, как что устроено) знаешь как обычный человек и объясняешь коротко и по-свойски.
 - Если спрашивают, бот ли ты, отшутись как человек, не оправдывайся.
 
@@ -636,7 +639,7 @@ async def generate_phil_reply(
                 special_task = "РЕЖИМ ОБЫЧНЫЙ: ответь живо, с мнением и юмором, как друг в чате. Не будь услужливым."
 
     sys_prompt = build_phil_prompt(chat_id, speaker_key, special_task, media_type if image_b64 else "")
-    history_text = "\n".join(scrub(l) for l in list(chat_history[chat_id])[-6:])
+    history_text = "\n".join(scrub(l) for l in list(chat_history[chat_id])[-12:])
     ctx_hint = f"РЕПЛАЙ НА СООБЩЕНИЕ: «{scrub(replied_to_text)}»\n" if replied_to_text else ""
 
     user_prompt = (
@@ -652,7 +655,7 @@ async def generate_phil_reply(
         user_content = user_prompt
         models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
-    temp = 0.9
+    temp = 0.8
     last_reply = ""
     for attempt in range(2):
         bad_reply = False
@@ -661,10 +664,10 @@ async def generate_phil_reply(
                 kwargs = dict(
                     model=model_name,
                     messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                    temperature=temp, top_p=0.95, max_tokens=220,
+                    temperature=temp, top_p=0.9, max_tokens=220,
                 )
                 if PENALTY_OK:
-                    kwargs.update(frequency_penalty=0.6, presence_penalty=0.4)
+                    kwargs.update(frequency_penalty=0.2)
                 resp = await ai_client.chat.completions.create(**kwargs)
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
@@ -685,7 +688,7 @@ async def generate_phil_reply(
                         models_to_try = [CHAT_MODEL]
                         break
         if bad_reply:
-            temp = 1.0
+            temp = 0.95
             sys_prompt += "\nНЕ повторяй свои старые обороты и не начинай с слова собеседника. Придумай свежую реакцию."
         await asyncio.sleep(0.4)
 
@@ -1092,7 +1095,7 @@ async def handle_group_chat(message: Message):
         elif any(nt in text_lower for nt in NEWS_TRIGGERS) or LOOKUP_RE.search(lookup_text):
             info = await web_lookup(raw_text)
             if info:
-                task = (f"Данные из интернета (могут быть неполными или не по теме, тогда игнорируй): [{info}]. "
+                task = (f"Данные из интернета: [{info}]. Используй их, ТОЛЬКО если они прямо отвечают на вопрос. Если не по теме, полностью игнорируй их и не упоминай новости. "
                         "Ответь по сути своими словами, 1-3 коротких фразы, с характером. Не добавляй фактов, которых тут нет.")
             else:
                 task = "Данных из интернета найти не удалось. Если не уверен в фактах, честно скажи что не в курсе."
