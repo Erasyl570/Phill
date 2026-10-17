@@ -20,6 +20,10 @@ from aiogram.types import (
     InlineKeyboardMarkup, InputMediaDocument, Message,
 )
 from openai import AsyncOpenAI
+from aiogram.exceptions import TelegramConflictError, TelegramUnauthorizedError
+from aiogram.methods import GetUpdates
+from aiogram.utils.backoff import Backoff, BackoffConfig
+from runtime import acquire_polling_lock, reply_models
 
 logging.basicConfig(level=logging.INFO)
 
@@ -28,8 +32,7 @@ ADMIN_ID = int((os.getenv("ADMIN_ID") or "0").strip())
 PORT = int((os.getenv("PORT") or "10000").strip())
 
 # Вшитый рабочий ключ DarkAPI + поддержка ключей из Render Environment
-HARDCODED_DARKAPI_KEY = "tc_live_ea0bc4cb88018961016ec5b6303ae5b330ff486e517a9972"
-PRIMARY_DARKAPI_KEY = (os.getenv("DARKAPI_KEY") or HARDCODED_DARKAPI_KEY).strip()
+PRIMARY_DARKAPI_KEY = (os.getenv("DARKAPI_KEY") or "").strip()
 PRIMARY_DARKAPI_URL = "https://darkapi.shop/v1"
 ENV_BACKUP_KEY = (os.getenv("API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
 ENV_BASE_URL = (os.getenv("AI_BASE_URL") or "").strip()
@@ -48,7 +51,7 @@ POLL_EVENT_MIN_HOURS = 14
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0.0.0 Safari/537.36"}
 API_KEY = ENV_BACKUP_KEY or PRIMARY_DARKAPI_KEY
 BASE_URL = PRIMARY_DARKAPI_URL
-ai_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, default_headers=BROWSER_HEADERS)
+ai_client = AsyncOpenAI(api_key=API_KEY or "not-configured", base_url=BASE_URL, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
 
 # Строгий приоритет: сначала Qwen, а при лимите или сбое — DeepSeek / Claude
 PREFERRED_PRIMARY_MODELS = ["qwen", "deepseek-v4-pro", "deepseek", "claude-sonnet"]
@@ -70,7 +73,34 @@ BANNED_CRINGE_WORDS = (
 )
 
 bot = Bot(token=TELEGRAM_TOKEN)
-dp = Dispatcher()
+class SinglePollerDispatcher(Dispatcher):
+    @classmethod
+    async def _listen_updates(cls, bot, polling_timeout=30,
+                              backoff_config=BackoffConfig(min_delay=1.0, max_delay=5.0, factor=1.3, jitter=0.1),
+                              allowed_updates=None):
+        backoff = Backoff(config=backoff_config)
+        request = GetUpdates(timeout=polling_timeout, allowed_updates=allowed_updates)
+        while True:
+            try:
+                updates = await bot(request, request_timeout=polling_timeout + 10)
+            except TelegramConflictError:
+                logging.critical("Telegram 409: другой экземпляр использует getUpdates или включён webhook. "
+                                 "Остановите старый сервис/worker и оставьте одну реплику.")
+                raise
+            except TelegramUnauthorizedError:
+                logging.critical("Telegram отклонил токен: проверьте TELEGRAM_TOKEN запущенного сервиса.")
+                raise
+            except Exception as exc:
+                logging.warning("Telegram polling: %s", type(exc).__name__)
+                await backoff.asleep()
+                continue
+            backoff.reset()
+            for update in updates:
+                yield update
+                request.offset = update.update_id + 1
+
+
+dp = SinglePollerDispatcher()
 
 chat_history = defaultdict(lambda: deque(maxlen=16))
 user_only_history = defaultdict(lambda: deque(maxlen=10))
@@ -111,6 +141,7 @@ ai_stats = {"ok_t": 0.0, "err_t": 0.0, "err": "", "ok_n": 0, "err_n": 0}
 group_seen = defaultdict(lambda: {"n": 0, "t": 0.0})
 PENALTY_OK = True
 _lookup_cache: dict[str, tuple[float, str]] = {}
+unsupported_models: set[str] = set()
 
 
 def detect_url_for_key(key: str) -> str:
@@ -127,9 +158,9 @@ def detect_url_for_key(key: str) -> str:
 
 
 def get_key_pool() -> list[dict]:
-    """Собирает все ключи: сначала ключи с Qwen (Groq/добавленные в ЛС), затем вшитый DarkAPI."""
+    """Собирает настроенные ключи без встроенных секретов."""
     pool, seen = [], set()
-    raw_keys = brain.get("api_keys", []) + [ENV_BACKUP_KEY, PRIMARY_DARKAPI_KEY, HARDCODED_DARKAPI_KEY]
+    raw_keys = brain.get("api_keys", []) + [ENV_BACKUP_KEY, PRIMARY_DARKAPI_KEY]
     for k in raw_keys:
         kc = (k or "").strip()
         if kc and kc not in seen:
@@ -146,24 +177,31 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
 
     connected = False
     for item in pool:
+        test_client = None
         k, url = item["key"], item["url"]
         try:
-            test_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS)
+            test_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
             models_resp = await asyncio.wait_for(test_client.models.list(), timeout=8)
             clean_ids = [m.id for m in models_resp.data if not any(b in m.id.lower() for b in BAD_MODELS)]
             if clean_ids:
                 API_KEY, BASE_URL, ai_client = k, url, test_client
                 AVAILABLE_MODELS = sorted(clean_ids)
+                unsupported_models.clear()
                 connected = True
                 break
         except Exception as e:
-            logging.warning(f"Проверка {url}: {e}")
+            if test_client is not None:
+                await test_client.close()
+            logging.warning("Проверка %s: %s", url, type(e).__name__)
             if k.startswith("tc_"):
                 API_KEY, BASE_URL = k, url
-                ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS)
-                AVAILABLE_MODELS = DARKAPI_FALLBACK_MODELS.copy()
+                ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
+                AVAILABLE_MODELS = [ENV_MODEL] if ENV_MODEL else []
+                logging.error("Каталог моделей недоступен: задайте точный AI_MODEL или восстановите /models")
                 connected = True
                 break
+        else:
+            await test_client.close()
 
     if not connected:
         logging.error("Не удалось подключиться ни к одному ключу!")
@@ -180,7 +218,7 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
                 CHAT_MODEL = found
                 break
         else:
-            CHAT_MODEL = AVAILABLE_MODELS[0]
+            CHAT_MODEL = AVAILABLE_MODELS[0] if AVAILABLE_MODELS else ""
         brain["selected_model"] = CHAT_MODEL
 
     for pref in ["deepseek-v4.1-flash", "flash", "haiku", "luna", "glm", "qwen", "deepseek"]:
@@ -200,6 +238,10 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
         VISION_MODEL = CHAT_MODEL
 
     if ENV_MODEL:
+        if ENV_MODEL not in AVAILABLE_MODELS:
+            AVAILABLE_MODELS.append(ENV_MODEL)
+        if ENV_ANALYZER_MODEL and ENV_ANALYZER_MODEL not in AVAILABLE_MODELS:
+            AVAILABLE_MODELS.append(ENV_ANALYZER_MODEL)
         CHAT_MODEL = ENV_MODEL
         ANALYZER_MODEL = ENV_ANALYZER_MODEL or ENV_MODEL
         VISION_MODEL = ENV_MODEL
@@ -294,7 +336,7 @@ async def save_brain():
         chat = await bot.get_chat(ADMIN_ID)
         input_file = BufferedInputFile(raw_bytes, filename="brain.json")
         caption = f"🧠 Память Фила | Модель: {CHAT_MODEL}\nЖми /panel, /status или /code"
-        if chat.pinned_message and chat.pinned_message.from_user.id == (await bot.get_me()).id and chat.pinned_message.document:
+        if chat.pinned_message and chat.pinned_message.from_user.id == (await bot.me()).id and chat.pinned_message.document:
             await bot.edit_message_media(chat_id=ADMIN_ID, message_id=chat.pinned_message.message_id, media=InputMediaDocument(media=input_file, caption=caption))
         else:
             msg = await bot.send_document(ADMIN_ID, document=input_file, caption=caption)
@@ -584,8 +626,14 @@ async def generate_phil_reply(
         user_content = user_prompt
         models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
-    for attempt in range(2):
-        for model_name in list(dict.fromkeys(m for m in models_to_try if m))[:4]:
+    models_to_try = reply_models(CHAT_MODEL, VISION_MODEL, AVAILABLE_MODELS,
+                                 PREFERRED_FALLBACK_MODELS, unsupported_models, bool(image_b64))
+    deadline = time.monotonic() + 22
+    for model_name in models_to_try:
+        for parameter_attempt in range(2):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return ""
             try:
                 kwargs = dict(
                     model=model_name,
@@ -594,27 +642,25 @@ async def generate_phil_reply(
                 )
                 if PENALTY_OK:
                     kwargs.update(frequency_penalty=0.2)
-                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=14)
+                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(10, remaining))
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
                     ai_stats.update(ok_t=time.time(), ok_n=ai_stats["ok_n"] + 1)
                     return reply
             except Exception as e:
-                logging.warning(f"AI ошибка [{model_name} @ {BASE_URL}]: {str(e)[:200]}")
-                ai_stats.update(err_t=time.time(), err=f"{model_name} @ {BASE_URL}: {str(e)[:250]}", err_n=ai_stats["err_n"] + 1)
+                logging.warning("AI ошибка [%s]: %s", model_name, type(e).__name__)
+                ai_stats.update(err_t=time.time(), err=f"{model_name}: {type(e).__name__}", err_n=ai_stats["err_n"] + 1)
                 err = str(e).lower()
-                if PENALTY_OK and "penalty" in err:
+                if PENALTY_OK and "penalty" in err and parameter_attempt == 0:
                     PENALTY_OK = False
                     continue
-                if any(code in err for code in ("429", "402", "401", "rate", "limit", "quota")):
-                    if await switch_to_deepseek_on_limit():
-                        models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
-                        break
-        await asyncio.sleep(0.3)
+                if any(code in err for code in ("unsupported_model", "model_not_found", "model not found", "does not exist")):
+                    unsupported_models.add(model_name)
+                if getattr(e, "status_code", None) in (401, 402, 403, 429):
+                    return ""
+            break
 
-    if image_b64:
-        return await generate_phil_reply(chat_id, trigger_text, speaker_key, special_task, None, "", replied_to_text)
     return ""
 
 
@@ -951,7 +997,7 @@ async def handle_group_chat(message: Message):
             if len(gdata["known_tags"]) > 20:
                 gdata["known_tags"] = gdata["known_tags"][-20:]
 
-    bot_info = await bot.get_me()
+    bot_info = await bot.me()
     is_reply_to_bot = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id == bot_info.id)
     is_reply_to_other = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id != bot_info.id)
     is_forwarded = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from_chat", None) or getattr(message, "forward_from", None))
@@ -1115,19 +1161,26 @@ async def start_web_server():
 
 
 async def main():
-    await start_web_server()
+    lock = acquire_polling_lock(TELEGRAM_TOKEN)
+    tasks = []
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-    except Exception:
-        logging.exception("ОШИБКА ТОКЕНА ТГ: проверь переменную TELEGRAM_TOKEN в Render!")
-    await load_brain()
-    await init_ai_models()
-    asyncio.create_task(dead_chat_reviver())
-    asyncio.create_task(keep_alive())
-    try:
-        await dp.start_polling(bot)
+        await start_web_server()
+        # Fail before launching background work if the token is invalid.
+        await bot.me()
+        await bot.delete_webhook(drop_pending_updates=False)
+        await load_brain()
+        await init_ai_models()
+        if not AVAILABLE_MODELS or not CHAT_MODEL:
+            raise RuntimeError("Нет доступной модели: проверьте ключ API и AI_MODEL")
+        tasks = [asyncio.create_task(dead_chat_reviver()), asyncio.create_task(keep_alive())]
+        await dp.start_polling(bot, close_bot_session=False)
     finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await ai_client.close()
         await bot.session.close()
+        lock.close()
 
 
 if __name__ == "__main__":
