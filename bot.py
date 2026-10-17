@@ -7,6 +7,7 @@ import logging
 import os
 import random
 import re
+import signal
 import time
 from collections import defaultdict, deque
 from datetime import datetime
@@ -84,13 +85,15 @@ class SinglePollerDispatcher(Dispatcher):
             try:
                 updates = await bot(request, request_timeout=polling_timeout + 10)
             except TelegramConflictError:
-                logging.warning("Telegram 409: другой экземпляр использует getUpdates или включён webhook. "
-                                "Жду 15с, удаляю webhook и пробую снова (Render zero-downtime overlap).")
+                # Фикс для Render: при деплое 2 инстанса живут параллельно 10-20с
+                # Делаем быстрый retry вместо 15с ожидания
+                wait = random.uniform(2.5, 4.5)
+                logging.warning(f"Telegram 409: другой инстанс активен. Жду {wait:.1f}с и удаляю webhook...")
                 try:
                     await bot.delete_webhook(drop_pending_updates=True)
                 except Exception:
                     pass
-                await asyncio.sleep(15)
+                await asyncio.sleep(wait)
                 continue
             except TelegramUnauthorizedError:
                 logging.critical("Telegram отклонил токен: проверьте TELEGRAM_TOKEN запущенного сервиса.")
@@ -633,7 +636,7 @@ async def generate_phil_reply(
 
     models_to_try = reply_models(CHAT_MODEL, VISION_MODEL, AVAILABLE_MODELS,
                                  PREFERRED_FALLBACK_MODELS, unsupported_models, bool(image_b64))
-    deadline = time.monotonic() + 22
+    deadline = time.monotonic() + 18  # было 22, уменьшили для быстрого фолбэка
     for model_name in models_to_try:
         for parameter_attempt in range(2):
             remaining = deadline - time.monotonic()
@@ -647,14 +650,17 @@ async def generate_phil_reply(
                 )
                 if PENALTY_OK:
                     kwargs.update(frequency_penalty=0.2)
-                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(10, remaining))
+                # Быстрый таймаут 7с вместо 10с — чтобы не висеть на deepseek-v4-pro
+                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(7, remaining))
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
                     ai_stats.update(ok_t=time.time(), ok_n=ai_stats["ok_n"] + 1)
                     return reply
             except Exception as e:
-                logging.warning("AI ошибка [%s]: %s", model_name, type(e).__name__)
+                # Быстрый фолбэк при таймауте — не ждем 10с, сразу пробуем следующую модель
+                is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower()
+                logging.warning("AI ошибка [%s]: %s %s", model_name, type(e).__name__, "(таймаут, быстрый фолбэк)" if is_timeout else "")
                 ai_stats.update(err_t=time.time(), err=f"{model_name}: {type(e).__name__}", err_n=ai_stats["err_n"] + 1)
                 err = str(e).lower()
                 if PENALTY_OK and "penalty" in err and parameter_attempt == 0:
@@ -662,8 +668,12 @@ async def generate_phil_reply(
                     continue
                 if any(code in err for code in ("unsupported_model", "model_not_found", "model not found", "does not exist")):
                     unsupported_models.add(model_name)
-                if getattr(e, "status_code", None) in (401, 402, 403, 429):
+                # При 429/401 сразу прерываем попытки — нет смысла спамить
+                if getattr(e, "status_code", None) in (401, 402, 403):
                     return ""
+                # При таймауте или 429 — сразу пробуем следующую модель без задержки
+                if is_timeout or getattr(e, "status_code", None) == 429:
+                    continue
             break
 
     return ""
@@ -1168,6 +1178,18 @@ async def start_web_server():
 async def main():
     lock = acquire_polling_lock(TELEGRAM_TOKEN)
     tasks = []
+    # Graceful shutdown для Render — чтобы старый инстанс быстро освобождал getUpdates
+    loop = asyncio.get_running_loop()
+    stop_event = asyncio.Event()
+    def _handle_term():
+        logging.info("SIGTERM/SIGINT received — завершаю polling для освобождения токена")
+        stop_event.set()
+    try:
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, _handle_term)
+    except NotImplementedError:
+        pass  # Windows
+
     try:
         await start_web_server()
         # Fail before launching background work if the token is invalid.
@@ -1180,8 +1202,8 @@ async def main():
         tasks = [asyncio.create_task(dead_chat_reviver()), asyncio.create_task(keep_alive())]
 
         # Retry loop — критично для Render: при деплое 10-20с работают 2 инстанса, будет 409
-        retry_delay = 5
-        while True:
+        retry_delay = 2
+        while not stop_event.is_set():
             try:
                 logging.info("🚀 Start polling @phillchatbot")
                 await dp.start_polling(bot, close_bot_session=False)
@@ -1193,10 +1215,13 @@ async def main():
                 except Exception:
                     pass
                 await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 1.5, 60)
+                retry_delay = min(retry_delay * 1.3, 15)
             except TelegramUnauthorizedError:
                 logging.critical("Telegram токен неверный — проверь TELEGRAM_TOKEN")
                 raise
+            if stop_event.is_set():
+                logging.info("Остановка по сигналу — выхожу из retry loop")
+                break
     finally:
         for task in tasks:
             task.cancel()
