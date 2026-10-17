@@ -265,7 +265,7 @@ async def get_user_custom_title(chat_id: int, user_id: int) -> str:
 
 
 async def fetch_fresh_news(query_text: str) -> str:
-    clean_q = re.sub(r"\b(фил|филл|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире)\b", "", query_text, flags=I := re.I).strip(" ?!.,")
+clean_q = re.sub(r"\b(фил|филл|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире)\b", "", query_text, flags=I := re.I).strip(" ?!.,")
     url = f"https://news.google.com/rss/search?q={quote_plus(clean_q)}&hl=ru&gl=RU&ceid=RU:ru" if len(clean_q) > 2 else "https://news.google.com/rss?hl=ru&gl=RU&ceid=RU:ru"
     try:
         async with aiohttp.ClientSession() as session:
