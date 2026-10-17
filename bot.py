@@ -30,6 +30,9 @@ PORT = int(os.getenv("PORT", "10000"))
 PRIMARY_DARKAPI_KEY = (os.getenv("DARKAPI_KEY") or "").strip()
 PRIMARY_DARKAPI_URL = "https://darkapi.shop/v1"
 ENV_BACKUP_KEY = (os.getenv("API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
+ENV_BASE_URL = (os.getenv("AI_BASE_URL") or "").strip()   # адрес любого OpenAI-совместимого API
+ENV_MODEL = (os.getenv("AI_MODEL") or "").strip()         # точное имя модели для ответов
+ENV_ANALYZER_MODEL = (os.getenv("AI_ANALYZER_MODEL") or "").strip()  # лёгкая модель (необязательно)
 
 BOT_NAMES = ["фил", "филл", "филя", "филип", "барбос"]
 
@@ -46,7 +49,7 @@ BASE_URL = PRIMARY_DARKAPI_URL
 ai_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, default_headers=BROWSER_HEADERS)
 
 # Приоритет Qwen, а при лимите — переключение на DeepSeek / Claude
-PREFERRED_PRIMARY_MODELS = ["qwen", "deepseek-v4-pro", "deepseek", "claude-sonnet"]
+PREFERRED_PRIMARY_MODELS = ["deepseek-v4-pro", "deepseek", "qwen", "claude-sonnet"]
 PREFERRED_FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek", "claude-sonnet-5.5", "glm-5.3", "gpt-oss-120b"]
 
 CHAT_MODEL = "deepseek-v4-pro"
@@ -93,6 +96,8 @@ NEWS_TRIGGERS = (
 
 def detect_url_for_key(key: str) -> str:
     k = key.strip()
+    if ENV_BASE_URL and k == ENV_BACKUP_KEY:
+        return ENV_BASE_URL
     if k.startswith("tc_"):
         return "https://darkapi.shop/v1"
     if k.startswith("gsk_"):
@@ -104,9 +109,7 @@ def detect_url_for_key(key: str) -> str:
 
 def get_key_pool() -> list[dict]:
     pool, seen = [], set()
-    raw_keys = brain.get("api_keys", []) + [PRIMARY_DARKAPI_KEY]
-    if ENV_BACKUP_KEY:
-        raw_keys.insert(0, ENV_BACKUP_KEY)
+    raw_keys = [PRIMARY_DARKAPI_KEY, ENV_BACKUP_KEY] + brain.get("api_keys", [])
     for k in raw_keys:
         kc = k.strip()
         if kc and kc not in seen:
@@ -136,6 +139,7 @@ async def init_ai_models(force_key: str | None = None):
         except Exception as e:
             logging.warning(f"Проверка {url}: {e}")
             if k.startswith("tc_"):
+                logging.warning("darkapi не отдал список моделей, беру запасной список (сервер может быть недоступен)")
                 API_KEY, BASE_URL = k, url
                 ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS)
                 AVAILABLE_MODELS = DARKAPI_FALLBACK_MODELS.copy()
@@ -143,6 +147,7 @@ async def init_ai_models(force_key: str | None = None):
                 break
 
     if not connected:
+        logging.error("НИ ОДИН API-КЛЮЧ НЕ ПОДОШЁЛ: проверь DARKAPI_KEY / API_KEY в Environment")
         return
 
     saved = brain.get("selected_model")
@@ -173,6 +178,17 @@ async def init_ai_models(force_key: str | None = None):
             break
     else:
         VISION_MODEL = CHAT_MODEL
+
+    if not ENV_MODEL and "darkapi" in BASE_URL and "deepseek-v4-pro" in AVAILABLE_MODELS:
+        CHAT_MODEL = "deepseek-v4-pro"
+        brain["selected_model"] = CHAT_MODEL
+
+    if ENV_MODEL:  # модель из переменных окружения важнее автовыбора
+        CHAT_MODEL = ENV_MODEL
+        ANALYZER_MODEL = ENV_ANALYZER_MODEL or ENV_MODEL
+        VISION_MODEL = ENV_MODEL
+        brain["selected_model"] = CHAT_MODEL
+    logging.info(f"AI подключён: {BASE_URL} | чат: {CHAT_MODEL} | анализ: {ANALYZER_MODEL} | моделей в списке: {len(AVAILABLE_MODELS)}")
 
 
 async def switch_to_next_key_on_limit() -> bool:
@@ -653,7 +669,7 @@ async def generate_phil_reply(
         models_to_try = [VISION_MODEL, CHAT_MODEL]
     else:
         user_content = user_prompt
-        models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
+        models_to_try = [CHAT_MODEL] if ENV_MODEL else [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
     temp = 0.8
     last_reply = ""
@@ -678,6 +694,7 @@ async def generate_phil_reply(
                         break
                     return reply
             except Exception as e:
+                logging.warning(f"AI ошибка [{model_name} @ {BASE_URL}]: {str(e)[:200]}")
                 err = str(e).lower()
                 if PENALTY_OK and "penalty" in err:
                     PENALTY_OK = False
@@ -694,6 +711,7 @@ async def generate_phil_reply(
 
     if last_reply:
         return last_reply
+    logging.warning("AI вернул пустой ответ, бот промолчит")
     if image_b64:
         return await generate_phil_reply(chat_id, trigger_text, speaker_key, special_task, None, "", replied_to_text)
     return ""
@@ -1050,6 +1068,7 @@ async def handle_group_chat(message: Message):
     words_in_msg = [w.strip(".,!?()\"'") for w in text_lower.split()]
     is_named = any(w.startswith(tuple(BOT_NAMES)) for w in words_in_msg)
 
+    logging.info(f"[{chat_id}] named={is_named} mention={is_mentioned} reply_to_bot={is_reply_to_bot} mode={gdata.get('mode')}")
     if is_forwarded and not (is_mentioned or is_named or is_reply_to_bot):
         return
 
@@ -1066,6 +1085,7 @@ async def handle_group_chat(message: Message):
         asyncio.create_task(learn_from_messages(chat_id, "\n".join(list(user_only_history[chat_id]))))
 
     if gdata.get("mode") == "silent":
+        logging.info(f"[{chat_id}] группа в режиме silent, бот молчит")
         return
 
     if (now - last_poll_time[chat_id]) / 3600 >= random.uniform(POLL_EVENT_MIN_HOURS, POLL_EVENT_MIN_HOURS + 10) and len(gdata.get("known_tags", [])) >= 2:
