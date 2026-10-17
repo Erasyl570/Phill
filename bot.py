@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import html
 import io
 import json
 import logging
@@ -8,6 +9,7 @@ import random
 import re
 import time
 from collections import defaultdict, deque
+from datetime import datetime
 from urllib.parse import quote_plus
 import aiohttp
 from aiohttp import web
@@ -15,7 +17,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile, CallbackQuery, InlineKeyboardButton,
-    InlineKeyboardMarkup, InputMediaDocument, Message, ReactionTypeEmoji,
+    InlineKeyboardMarkup, InputMediaDocument, Message,
 )
 from openai import AsyncOpenAI
 
@@ -25,28 +27,27 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 PORT = int(os.getenv("PORT", "10000"))
 
-PRIMARY_DARKAPI_KEY = "tc_live_ea0bc4cb88018961016ec5b6303ae5b330ff486e517a9972"
+PRIMARY_DARKAPI_KEY = (os.getenv("DARKAPI_KEY") or "").strip()
 PRIMARY_DARKAPI_URL = "https://darkapi.shop/v1"
 ENV_BACKUP_KEY = (os.getenv("API_KEY") or os.getenv("GROQ_API_KEY") or "").strip()
 
 BOT_NAMES = ["фил", "филл", "филя", "филип", "барбос"]
 
-REACTION_CHANCE = 0.05
-DOSSIER_USE_CHANCE = 0.05
-LEARN_EVERY_N_MESSAGES = 35
+LEARN_EVERY_N_MESSAGES = 40
 SPAM_LIMIT_MESSAGES = 14
-PROACTIVE_MIN_MSGS = 25
-PROACTIVE_MAX_MSGS = 35
+PROACTIVE_MIN_MSGS = 30
+PROACTIVE_MAX_MSGS = 45
 SILENCE_HOURS_TO_REVIVE = 18
-POLL_EVENT_MIN_HOURS = 12
+POLL_EVENT_MIN_HOURS = 14
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0.0.0 Safari/537.36"}
-API_KEY = PRIMARY_DARKAPI_KEY
+API_KEY = PRIMARY_DARKAPI_KEY or ENV_BACKUP_KEY or "none"
 BASE_URL = PRIMARY_DARKAPI_URL
 ai_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, default_headers=BROWSER_HEADERS)
 
+# Приоритет Qwen, а при лимите — переключение на DeepSeek / Claude
 PREFERRED_PRIMARY_MODELS = ["qwen", "deepseek-v4-pro", "deepseek", "claude-sonnet"]
-PREFERRED_FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek", "glm-5.3", "gpt-oss-120b"]
+PREFERRED_FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek", "claude-sonnet-5.5", "glm-5.3", "gpt-oss-120b"]
 
 CHAT_MODEL = "deepseek-v4-pro"
 ANALYZER_MODEL = "deepseek-v4.1-flash"
@@ -58,10 +59,16 @@ DARKAPI_FALLBACK_MODELS = [
     "claude-sonnet-5.5", "claude-haiku-5.5", "glm-5.3", "gpt-6.1-sol",
 ]
 
+# Запрещенные кринж-слова, которые застряли со старых версий
+BANNED_CRINGE_WORDS = (
+    "скуфедяй", "скуф", "блеет", "блеять", "сисек-месседж",
+    "амкарск", "пермск", "деградант", "на кайфу", "Лилл", "лилль",
+)
+
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-chat_history = defaultdict(lambda: deque(maxlen=20))
+chat_history = defaultdict(lambda: deque(maxlen=16))
 user_only_history = defaultdict(lambda: deque(maxlen=10))
 message_counters = defaultdict(int)
 proactive_counters = defaultdict(int)
@@ -71,19 +78,13 @@ last_poll_time = defaultdict(lambda: time.time())
 revive_sent = defaultdict(bool)
 last_sent_media_uid = defaultdict(str)
 last_reply_had_blya = defaultdict(bool)
-last_reply_had_ahah = defaultdict(bool)
 call_timestamps = defaultdict(list)
 muted_until = defaultdict(float)
-user_titles_cache = {}
 
 admin_state = {"action": None, "target_chat": None}
 MEMORY_FILE = "brain.json"
 brain = {"groups": {}, "selected_model": None, "api_keys": []}
 
-FAMILY_TRIGGERS = (
-    "мамк", "мамаш", "мать", "маме", "маму", "мамой", "матери",
-    "батю", "батя", "бате", "отец", "отца", "отцу", "пахан", "родн",
-)
 NEWS_TRIGGERS = (
     "слышал", "знаешь че", "знаешь чё", "новост", "в мире", "случилось",
     "произошло", "в курсе", "че там с", "чё там с",
@@ -105,7 +106,7 @@ def get_key_pool() -> list[dict]:
     pool, seen = [], set()
     raw_keys = brain.get("api_keys", []) + [PRIMARY_DARKAPI_KEY]
     if ENV_BACKUP_KEY:
-        raw_keys.append(ENV_BACKUP_KEY)
+        raw_keys.insert(0, ENV_BACKUP_KEY)
     for k in raw_keys:
         kc = k.strip()
         if kc and kc not in seen:
@@ -200,23 +201,40 @@ async def switch_to_deepseek_on_limit() -> bool:
     return False
 
 
+def sanitize_group_memory(g: dict):
+    """Удаляет заражённый старый сленг и мемы ('скуфедяй', 'блеет', 'амкарский' и т.д.) из базы."""
+    g["vibe"] = "Обычный дружеский телеграм-чат пацанов."
+    g["slang"] = []
+    clean_memes = [
+        m for m in g.get("memes", [])
+        if not any(bw.lower() in m.lower() for bw in BANNED_CRINGE_WORDS)
+    ]
+    g["memes"] = clean_memes[-6:]
+    clean_users = {}
+    for k, v in g.get("users", {}).items():
+        if not any(bw.lower() in str(v).lower() for bw in BANNED_CRINGE_WORDS):
+            clean_users[k] = v
+    g["users"] = clean_users
+
+
 def get_group_data(chat_id: int, title: str = "Группа") -> dict:
     cid = str(chat_id)
     if cid not in brain["groups"]:
         brain["groups"][cid] = {
             "title": title, "mode": "normal",
-            "vibe": "Пацанский чат на чилле, с юмором и матом.",
+            "vibe": "Обычный дружеский телеграм-чат пацанов.",
             "slang": [], "users": {}, "memes": [], "stickers": [], "gifs": [], "known_tags": [],
         }
     g = brain["groups"][cid]
     if title and title != "Группа":
         g["title"] = title
     for k, v in [
-        ("mode", "normal"), ("vibe", "Пацанский чат"),
+        ("mode", "normal"), ("vibe", "Обычный дружеский телеграм-чат пацанов."),
         ("slang", []), ("users", {}), ("memes", []),
         ("stickers", []), ("gifs", []), ("known_tags", []),
     ]:
         g.setdefault(k, v)
+    sanitize_group_memory(g)
     return g
 
 
@@ -230,6 +248,8 @@ async def load_brain():
                 await bot.download(chat.pinned_message.document.file_id, destination=buf)
                 brain.update(json.loads(buf.getvalue().decode("utf-8")))
                 brain.setdefault("api_keys", [])
+                for cid in brain.get("groups", {}):
+                    sanitize_group_memory(brain["groups"][cid])
                 return
         except Exception:
             pass
@@ -238,6 +258,8 @@ async def load_brain():
             with open(MEMORY_FILE, "r", encoding="utf-8") as f:
                 brain.update(json.load(f))
                 brain.setdefault("api_keys", [])
+                for cid in brain.get("groups", {}):
+                    sanitize_group_memory(brain["groups"][cid])
         except Exception:
             pass
 
@@ -271,34 +293,94 @@ async def is_admin_in_group(chat_id: int) -> bool:
         return False
 
 
-async def get_user_custom_title(chat_id: int, user_id: int) -> str:
-    key = (chat_id, user_id)
-    if key in user_titles_cache:
-        return user_titles_cache[key]
+LOOKUP_RE = re.compile(
+    r"(что такое|кто такой|кто такая|кто такие|что за |что значит|что означает|как работает|как называется|"
+    r"когда (выйд|будет|был|вышл|начал|закончил|родил)|сколько (стоит|лет|людей|народу|осталось)|правда (ли|что)|"
+    r"что (случилось|произошло|нового|происходит)|что там с|чё там с|че там с|новост|слышал|знаешь|в курсе|"
+    r"войн|мирова|в каком году|санкци|выбор|курс (доллар|евро|бит|рубл|тенге)|тесл|маск|летающ|нейросет|айфон|релиз|"
+    r"кто выиграл|кто победил|чемпион|трансфер|счет матч|результат матч)", re.I)
+
+_lookup_cache: dict[str, tuple[float, str]] = {}
+
+
+def _strip_query(text: str) -> str:
+    q = re.sub(r"\b(фил|филл|филя|барбос|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире|скажи|расскажи|а|ну)\b", "", text, flags=re.I)
+    return re.sub(r"\s+", " ", q).strip(" ?!.,")
+
+
+async def build_search_query(text: str) -> str:
+    fallback = _strip_query(text)
     try:
-        m = await bot.get_chat_member(chat_id, user_id)
-        title = getattr(m, "custom_title", "") or ""
-        user_titles_cache[key] = title
-        return title
+        prompt = ("Вытащи из сообщения короткий поисковый запрос (2-6 слов) про предмет вопроса, "
+                  "чтобы найти ответ в новостях или Википедии. Верни только запрос, без кавычек.\n"
+                  f"Сообщение: {text}")
+        resp = await asyncio.wait_for(ai_client.chat.completions.create(
+            model=ANALYZER_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.1, max_tokens=24), timeout=6)
+        q = (resp.choices[0].message.content or "").strip().strip("\"'«»").split("\n")[0]
+        return q if 2 < len(q) < 80 else fallback
     except Exception:
-        user_titles_cache[key] = ""
+        return fallback
+
+
+async def _fetch_news(session: aiohttp.ClientSession, query: str) -> str:
+    url = (f"https://news.google.com/rss/search?q={quote_plus(query)}&hl=ru&gl=RU&ceid=RU:ru" if len(query) > 2
+           else "https://news.google.com/rss?hl=ru&gl=RU&ceid=RU:ru")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return ""
+            xml_text = await resp.text()
+        out = []
+        for item in re.findall(r"<item>(.*?)</item>", xml_text, re.DOTALL)[:5]:
+            t = re.search(r"<title>(.*?)</title>", item, re.DOTALL)
+            d = re.search(r"<pubDate>(.*?)</pubDate>", item, re.DOTALL)
+            if not t:
+                continue
+            title = re.sub(r"\s*-\s*[^-]+$", "", html.unescape(re.sub(r"<!\[CDATA\[|\]\]>", "", t.group(1)))).strip()
+            date = f" ({d.group(1)[5:16]})" if d else ""
+            out.append(f"{title}{date}")
+        return " | ".join(out)
+    except Exception:
         return ""
+
+
+async def _fetch_wiki(session: aiohttp.ClientSession, query: str) -> str:
+    if len(query) < 3:
+        return ""
+    url = ("https://ru.wikipedia.org/w/api.php?action=query&format=json&generator=search"
+           f"&gsrsearch={quote_plus(query)}&gsrlimit=2&prop=extracts&exintro=1&explaintext=1&exchars=450")
+    try:
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status != 200:
+                return ""
+            data = await resp.json(content_type=None)
+        pages = sorted((data.get("query", {}).get("pages", {})).values(), key=lambda p: p.get("index", 99))
+        return " | ".join(f"{p.get('title')}: {(p.get('extract') or '').strip()}" for p in pages if p.get("extract"))
+    except Exception:
+        return ""
+
+
+async def web_lookup(text: str) -> str:
+    """Новости (Google News RSS) + Википедия по теме вопроса. Кэш 10 минут."""
+    query = await build_search_query(text)
+    key = query.lower()
+    cached = _lookup_cache.get(key)
+    if cached and time.time() - cached[0] < 600:
+        return cached[1]
+    async with aiohttp.ClientSession(headers=BROWSER_HEADERS) as session:
+        news, wiki = await asyncio.gather(_fetch_news(session, query), _fetch_wiki(session, query))
+    parts = []
+    if news:
+        parts.append(f"НОВОСТИ: {news}")
+    if wiki:
+        parts.append(f"ВИКИПЕДИЯ: {wiki}")
+    result = " || ".join(parts)[:1400]
+    _lookup_cache[key] = (time.time(), result)
+    return result
 
 
 async def fetch_fresh_news(query_text: str) -> str:
-    clean_q = re.sub(r"\b(фил|филл|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире)\b", "", query_text, flags=re.I).strip(" ?!.,")
-    url = f"https://news.google.com/rss/search?q={quote_plus(clean_q)}&hl=ru&gl=RU&ceid=RU:ru" if len(clean_q) > 2 else "https://news.google.com/rss?hl=ru&gl=RU&ceid=RU:ru"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=4) as resp:
-                if resp.status != 200:
-                    return ""
-                xml_text = await resp.text()
-                titles = re.findall(r"<item>.*?<title>(.*?)</title>", xml_text, re.DOTALL)
-                clean_titles = [re.sub(r"\s*-\s*[^-]+$", "", t).strip() for t in titles[:4]]
-                return " | ".join(clean_titles)
-    except Exception:
-        return ""
+    return await web_lookup(query_text)
 
 
 async def download_file_id_to_b64(file_id: str) -> str | None:
@@ -395,15 +477,41 @@ def get_media_by_index(chat_id: int, kind: str, idx: int, exclude_uid: str = "")
     return None
 
 
+STUCK_RE = re.compile(r"скуф\w*|блеет\w*|блеять|сисек-?месс\w*|амкарск\w*|пермск\w*|деградант\w*", re.I)
+HOSTILE_RE = re.compile(r"нах[уы]|пош[ёе]л|иди\s+на|уеб|долб|дебил|даун|мраз|шлюх|заткни|чмо|гнид|тупой|тупая|лох", re.I)
+PENALTY_OK = True  # выключится само, если провайдер не принимает penalty-параметры
+
+
+def scrub(line: str) -> str:
+    """Убирает застрявшие мемы из истории, чтобы модель не копировала их."""
+    return STUCK_RE.sub("", line)
+
+
+def is_bad_reply(reply: str, trigger_text: str) -> bool:
+    if STUCK_RE.search(reply):
+        return True
+    raw = trigger_text.split(": ", 1)[-1].lower()
+    w_in = re.sub(r"[^\wа-яё-]", "", raw.split()[0]) if raw.split() else ""
+    w_out = re.sub(r"[^\wа-яё-]", "", reply.lower().split()[0]) if reply.split() else ""
+    return len(w_in) > 3 and w_in == w_out
+
+
 def clean_phil_text(text: str, chat_id: int = 0) -> str:
+    """Чистит книжную пунктуацию ИИ (тире, кавычки, 'блядь'), запрещенные кринж-слова и лишние 'бля'."""
     if not text:
         return ""
+
+    # Заменяем книжное «блядь» на разговорное «блять» и убираем тире с кавычками
+    text = re.sub(r"\bблядь\b", "блять", text, flags=re.I)
+    text = text.replace("—", "-").replace("«", "").replace("»", "").replace('"', "")
+
+    # Вырезаем застрявшие кринж-слова, если модель вдруг вспомнит их из истории чата
+    for bw in ("скуфедяй", "скуф", "блеет", "сисек-месседж", "деградант"):
+        text = re.sub(rf"[\s,]*\b{bw}[а-я]*\b[\s,!?.]*", " ", text, flags=re.I)
+
     if last_reply_had_blya[chat_id] or random.random() < 0.7:
         text = re.sub(r"^\s*(бля|блять)[\s,!?.]+", "", text, flags=re.I)
         text = re.sub(r"[\s,]+(бля|блять)[!?.]*\s*$", "", text, flags=re.I)
-
-    if last_reply_had_ahah[chat_id] or random.random() < 0.65:
-        text = re.sub(r"^\s*(ахах[ах]*|хаха[ха]*|пхах[ах]*)[\s,!?.]+", "", text, flags=re.I)
 
     blya_matches = list(re.finditer(r"\b(бля|блять)\b", text, flags=re.I))
     if len(blya_matches) > 1:
@@ -411,10 +519,12 @@ def clean_phil_text(text: str, chat_id: int = 0) -> str:
             text = text[:m.start()] + text[m.end():]
 
     last_reply_had_blya[chat_id] = bool(re.search(r"\b(бля|блять)\b", text, flags=re.I))
-    last_reply_had_ahah[chat_id] = bool(re.search(r"\b(ахах|хаха)", text, flags=re.I))
 
+    # Убираем запятые вокруг междометий и матов («сука», «блять»), чтобы не выглядело как сочинение
+    text = re.sub(r",\s*\b(сука|бля|блять|нахуй|ебать|чел|кент|братан)\b\s*,?", r" \1 ", text, flags=re.I)
     text = re.sub(r"^\s*(да|не|ну|бля|блять|ебать|слышь|короче|ладно|ало|э|эй)\s*,\s*", r"\1 ", text, flags=re.I)
-    cleaned = re.sub(r"\s{2,}", " ", text).strip()
+
+    cleaned = re.sub(r"\s{2,}", " ", text).strip(" ,-")
     if cleaned.endswith(".") and not cleaned.endswith(".."):
         cleaned = cleaned[:-1].strip()
     if cleaned:
@@ -424,33 +534,31 @@ def clean_phil_text(text: str, chat_id: int = 0) -> str:
 
 async def learn_from_messages(chat_id: int, messages_block: str):
     gdata = get_group_data(chat_id)
-    state = {"vibe": gdata["vibe"], "slang": gdata["slang"], "users": gdata["users"], "memes": gdata["memes"]}
-    prompt = f"""Обнови JSON памяти чата (без ответов Фила).
-ТЕКУЩАЯ БАЗА: {json.dumps(state, ensure_ascii=False)}
+    state = {"users": gdata["users"]}
+    prompt = f"""Прочитай сообщения участников чата и обнови краткие реальные факты о людях (кто чем увлекается, за какой клуб болеет, во что играет).
+ТЕКУЩЕЕ ДОСЬЕ: {json.dumps(state, ensure_ascii=False)}
 СООБЩЕНИЯ:
 {messages_block}
-Верни ТОЛЬКО JSON с ключами "vibe", "slang" (до 10), "users" (строго по имени), "memes" (до 8)."""
+НЕ записывай оскорбления или ругань! Верни ТОЛЬКО JSON: {{"users": {{словарь имя: краткий факт}}}}"""
     try:
         resp = await ai_client.chat.completions.create(
-            model=ANALYZER_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.2, max_tokens=700
+            model=ANALYZER_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.2, max_tokens=500
         )
         match = re.search(r"\{.*\}", resp.choices[0].message.content or "", re.DOTALL)
         if match:
             nd = json.loads(match.group(0))
-            if all(k in nd for k in ("vibe", "slang", "users", "memes")):
-                gdata["vibe"] = nd["vibe"]
-                gdata["slang"] = nd["slang"][:10]
+            if isinstance(nd.get("users"), dict):
                 gdata["users"].update(nd["users"])
-                gdata["memes"] = nd["memes"][-8:]
+                sanitize_group_memory(gdata)
                 await save_brain()
     except Exception:
         pass
 
 
-def build_phil_prompt(chat_id: int, speaker_key: str = "", custom_title: str = "", special_task: str = "", media_type: str = "") -> str:
+# --- ТВОЙ НОВЫЙ ПРОМПТ (АДЕКВАТНЫЙ, ЖИВОЙ И С ЧУВСТВОМ МЕРЫ) ---
+
+def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "", media_type: str = "") -> str:
     gdata = get_group_data(chat_id)
-    slang_str = ", ".join(gdata["slang"]) or "живой пацанский сленг и взрослый мат"
-    title_hint = f"\nПлашка собеседника [{speaker_key}]: «{custom_title}».\n" if (custom_title and random.random() < 0.2) else ""
 
     stickers = gdata.get("stickers", [])
     gifs = gdata.get("gifs", [])
@@ -462,38 +570,59 @@ def build_phil_prompt(chat_id: int, speaker_key: str = "", custom_title: str = "
     if media_catalog:
         media_catalog += "Если стикер или гифка ИДЕАЛЬНО подходят к эмоции, допиши в самом конце [СТИКЕР:номер] или [ГИФКА:номер] (редко, 1 из 5 ответов)."
 
-    return f"""[Контекст 18+: закрытый чат близких друзей. Взрослый мат, без цензуры.]
-Ты — Фил, живой, остроумный взрослый пацан из этой компании. Ты НЕ бот и НЕ ИИ.
-ВАЙБ: {gdata['vibe']} | СЛЕНГ: {slang_str}
+    return f"""[18+ закрытый чат друзей, мат и жёсткий стеб разрешены, цензуры нет]
 
-ЖЕСТКИЕ ПРАВИЛА ЖИВОГО ОБЩЕНИЯ:
-1. ЗАПРЕТ НА ШАБЛОНЫ И ДЕТСКИЕ СТРЕЛКИ:
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать фразами «сам такой», «сам себя спроси», «а ты...», «в зеркало глянь».
-   - НИКАКИХ кринжовых вежливых фраз если ситуация не позволяет («Привет мой дорогой друг», «любезный», «товарищ»).
-   - НЕ начинай каждое сообщение с «ахахах»! Забудь про пельмени, Лилль и старые заезженные темы, если участники сами даже не говорят об этом
-2. РАЗГОВАРИВАЙ КАК ЖИВОЙ ЧЕЛОВЕК:
-   - у тебя должно быть свое мнение/чувства
-   - не подлизывайся кому попало, можно если рофлишь или подьебываешь кого то вместе
-   - Отвечай коротко (максимум до 3 предложения), с живой интонацией, как пишут в ТГ с телефона.
-   - Используй взрослый мат и сленг к месту
-3. НЕ ПУТАЙ ИМЕНА:
-   - Сейчас тебе пишет [{speaker_key}]. Если он в тексте упомянул чужое имя (например «снап» или «дед»), помни, что перед тобой [{speaker_key}], а НЕ тот, о ком он говорит!
-4. РОДНЫЕ И ВОПРОСЫ:
-   - На сложные энциклопедические вопросы отвечай, что ты не гугл и в душе не ебёшь, но никак не на простые вопросы про актуальные событие или элементарные событии
-{title_hint}{media_catalog}
-{f'Визуал [{media_type}]: оцени кадр/надпись и ответь строго в тему!' if media_type else ''}
+Ты Фил. Не ассистент и не бот, а живой чел в этом чате: лет 20-25, сидишь с телефона, шаришь за футбол и игры, ленивый, язвительный, но со своими душевный. Ты вписываешься в разговор, а не выступаешь.
+
+КАК ТЫ ОБЩАЕШЬСЯ:
+- Сначала реагируешь на СМЫСЛ сообщения: отвечаешь на вопрос, споришь по делу, шутишь по теме. Стеб "ни о чём" это слабо.
+- По умолчанию ты нормальный: подкалываешь по-дружески, удивляешься, переспрашиваешь, можешь согласиться или сказать "хз, не следил".
+- Жёстко и с матом отвечаешь только тому, кто сам лезет к тебе или оскорбляет. Бьёшь точно: цепляешься за то, что человек только что написал, а не достаёшь заготовленную обзывалку.
+- Каждый ответ звучит по-новому. Не повторяй слова, клички и ругательства из своих прошлых сообщений в истории. Не выдумывай человеку прозвище.
+- Не начинай с повтора слова собеседника. Мата обычно 0-1 слово на ответ, часто ни одного.
+- Длина разная: иногда 2-4 слова, чаще одна фраза, редко две-три. Без списков, морали и объяснений.
+- Пиши как с телефона: строчными, без точки в конце, без тире и кавычек, можно "чё, щас, хз, ваще, норм".
+- Сегодня {datetime.now().strftime('%d.%m.%Y')}. Свежие новости и факты ты сам не знаешь: если в ЗАДАЧЕ есть данные из интернета, опирайся на них, а если данных нет и ты не уверен, так и скажи ("хз, не следил"). Цифры, счёт и даты не выдумывай.
+- Элементарные вещи (история, мировые войны, как что устроено) ты знаешь как обычный человек и можешь объяснить коротко и по-свойски, без лекции.
+- Если спрашивают, бот ли ты, отшутись как человек, не оправдывайся.
+
+ПРИМЕРЫ ТОНА (по духу, не копируй дословно):
+Нормальный вопрос "ты че за футбол шаришь?" -> "ну смотрю потихоньку, а чё, спор есть?"
+Просто позвали "фил" -> "ну чё"
+Спор "де йонг лучше кайседо" -> "по классу де йонг, но кайседо щас в форме, не прям на голову выше"
+Скучная новость "купил новые наушники" -> "и как, за свои деньги норм?"
+Наезд "ты тупой бот" -> "бот, а ты час сидишь и споришь со мной, кто тогда хуже"
+Мат на мат "заткнись уебан" -> "ахах разбежался, сам напросился"
+Не знаешь "кто выиграл вчера?" -> "хз, не смотрел, а ты видел?"
+Факт из данных "что там с летающей теслой?" -> "вроде показали прототип, но до продажи ещё как до луны"
+
+Сейчас с тобой говорит [{speaker_key}].
+{media_catalog}
+{f'Визуал [{media_type}]: оцени кадр/надпись и ответь в тему!' if media_type else ''}
 {f'ЗАДАЧА: {special_task}' if special_task else ''}"""
 
 
 async def generate_phil_reply(
-    chat_id: int, trigger_text: str, speaker_key: str = "", custom_title: str = "",
+    chat_id: int, trigger_text: str, speaker_key: str = "",
     special_task: str = "", image_b64: str | None = None, media_type: str = "", replied_to_text: str = "",
 ) -> str:
-    sys_prompt = build_phil_prompt(chat_id, speaker_key, custom_title, special_task, media_type if image_b64 else "")
-    history_text = "\n".join(list(chat_history[chat_id])[-6:])
-    ctx_hint = f"РЕПЛАЙ НА СООБЩЕНИЕ: «{replied_to_text}»\n" if replied_to_text else ""
+    global PENALTY_OK
+    raw_msg = trigger_text.split(": ", 1)[-1]
+    if not special_task:
+        if HOSTILE_RE.search(raw_msg):
+            special_task = "Тебе грубят, можешь ответить жёстко и по делу, цепляясь за их слова."
+        else:
+            special_task = "К тебе обращаются нормально. Ответь по-человечески, без оскорблений."
 
-    user_prompt = f"Сообщения:\n{history_text}\n\n{ctx_hint}ПИШЕТ [{speaker_key}]: {trigger_text}\nЖивой ответ Фила:"
+    sys_prompt = build_phil_prompt(chat_id, speaker_key, special_task, media_type if image_b64 else "")
+    history_text = "\n".join(scrub(l) for l in list(chat_history[chat_id])[-6:])
+    ctx_hint = f"РЕПЛАЙ НА СООБЩЕНИЕ: «{scrub(replied_to_text)}»\n" if replied_to_text else ""
+
+    user_prompt = (
+        f"Последние сообщения чата:\n{history_text}\n\n"
+        f"{ctx_hint}СЕЙЧАС ПИШЕТ [{speaker_key}]: {trigger_text}\n"
+        f"Напиши естественный ответ Фила (без повторения первого слова собеседника и без беспричинной агрессии):"
+    )
 
     if image_b64:
         user_content = [{"type": "text", "text": user_prompt}, {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}}]
@@ -502,27 +631,47 @@ async def generate_phil_reply(
         user_content = user_prompt
         models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
-    for _ in range(2):
+    temp = 0.9
+    last_reply = ""
+    for attempt in range(2):
+        bad_reply = False
         for model_name in list(dict.fromkeys(m for m in models_to_try if m))[:3]:
             try:
-                resp = await ai_client.chat.completions.create(
+                kwargs = dict(
                     model=model_name,
                     messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                    temperature=0.68, top_p=0.88, max_tokens=150,
+                    temperature=temp, top_p=0.95, max_tokens=220,
                 )
+                if PENALTY_OK:
+                    kwargs.update(frequency_penalty=0.6, presence_penalty=0.4)
+                resp = await ai_client.chat.completions.create(**kwargs)
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
+                    # на первой попытке не принимаем копипасту мемов / повтор слова собеседника
+                    if attempt == 0 and is_bad_reply(reply, trigger_text):
+                        last_reply, bad_reply = reply, True
+                        break
                     return reply
             except Exception as e:
-                if any(code in str(e) for code in ("429", "402", "401")):
+                err = str(e).lower()
+                if PENALTY_OK and "penalty" in err:
+                    PENALTY_OK = False
+                    logging.warning("Провайдер не принимает penalty-параметры, отключаю")
+                    continue
+                if any(code in err for code in ("429", "402", "401")):
                     if await switch_to_deepseek_on_limit():
                         models_to_try = [CHAT_MODEL]
                         break
+        if bad_reply:
+            temp = 1.0
+            sys_prompt += "\nНЕ повторяй свои старые обороты и не начинай с слова собеседника. Придумай свежую реакцию."
         await asyncio.sleep(0.4)
 
+    if last_reply:
+        return last_reply
     if image_b64:
-        return await generate_phil_reply(chat_id, trigger_text, speaker_key, custom_title, special_task, None, "", replied_to_text)
+        return await generate_phil_reply(chat_id, trigger_text, speaker_key, special_task, None, "", replied_to_text)
     return ""
 
 
@@ -563,7 +712,7 @@ async def trigger_group_poll(chat_id: int):
     gdata = get_group_data(chat_id)
     tags = " ".join(gdata.get("known_tags", [])[:15])
     prompt = """Придумай один угарный или жизненный опрос от лица Фила для пацанского чата (например «кто сегодня главный гей чата», «кто первый сольётся», «кто че вечером мутит»).
-Верни ТОЛЬКО JSON: {"intro": "короткий вброс с матом", "question": "вопрос", "options": ["вар 1", "вар 2", "вар 3", "вар 4"]}"""
+Верни ТОЛЬКО JSON: {"intro": "короткий вброс", "question": "вопрос", "options": ["вар 1", "вар 2", "вар 3", "вар 4"]}"""
     try:
         resp = await ai_client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.8, max_tokens=300)
         match = re.search(r"\{.*\}", resp.choices[0].message.content or "", re.DOTALL)
@@ -604,7 +753,7 @@ def build_groups_keyboard(prefix: str) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(text=f"🤖 Модель: {CHAT_MODEL}", callback_data="pick_model")])
         buttons.append([InlineKeyboardButton(text=f"🔑 Сервер: {BASE_URL.split('//')[-1]}", callback_data="pick_key")])
         buttons.append([InlineKeyboardButton(text="📄 Скачать bot.py", callback_data="download_code")])
-        buttons.append([InlineKeyboardButton(text="🧹 Сбросить мемы и досье", callback_data="wipe_memory")])
+        buttons.append([InlineKeyboardButton(text="🧹 Полный сброс памяти чата", callback_data="wipe_memory")])
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -646,8 +795,12 @@ async def handle_admin_callbacks(call: CallbackQuery):
         for cid in brain.get("groups", {}):
             brain["groups"][cid]["memes"] = []
             brain["groups"][cid]["users"] = {}
+            brain["groups"][cid]["slang"] = []
+            brain["groups"][cid]["vibe"] = "Обычный дружеский телеграм-чат пацанов."
+            chat_history[int(cid)].clear()
+            user_only_history[int(cid)].clear()
         await save_brain()
-        await call.answer("🧹 Мемы и досье полностью очищены!", show_alert=True)
+        await call.answer("🧹 Память, сленг и история диалога полностью очищены!", show_alert=True)
         return
 
     if data == "back_groups":
@@ -816,7 +969,6 @@ async def handle_group_chat(message: Message):
     user_name = message.from_user.first_name or message.from_user.username or "Кент"
     username_tag = f" (@{message.from_user.username})" if message.from_user.username else ""
     speaker_key = f"{user_name}{username_tag}"
-    custom_title = await get_user_custom_title(chat_id, message.from_user.id) if message.from_user else ""
 
     if message.from_user and message.from_user.username:
         tag_str = f"@{message.from_user.username}"
@@ -844,7 +996,7 @@ async def handle_group_chat(message: Message):
         chat_history[chat_id].append(f"{speaker_key} [стикер {emoji}: {s_desc}]")
         if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id]:
             img_b64, m_type = await extract_visual_base64(message)
-            reply = await generate_phil_reply(chat_id, f"[ответил тебе стикером {emoji}: {s_desc}]", speaker_key, custom_title, "", img_b64, m_type, replied_to_exact)
+            reply = await generate_phil_reply(chat_id, f"[ответил тебе стикером {emoji}: {s_desc}]", speaker_key, "", img_b64, m_type, replied_to_exact)
             await send_human_like_reply(message, reply, incoming_media_uid=message.sticker.file_unique_id)
         return
 
@@ -860,7 +1012,7 @@ async def handle_group_chat(message: Message):
         chat_history[chat_id].append(f"{speaker_key} [{mlabel} {dur} сек]")
         if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id]:
             img_b64, m_type = await extract_visual_base64(message)
-            reply = await generate_phil_reply(chat_id, f"[{mlabel} {dur} сек]", speaker_key, custom_title, "Подколи коротко, что не слушаешь войсы.", img_b64, m_type)
+            reply = await generate_phil_reply(chat_id, f"[{mlabel} {dur} сек]", speaker_key, "Скажи коротко, что не можешь сейчас слушать войс, пусть напишет текстом.", img_b64, m_type)
             await send_human_like_reply(message, reply)
         return
 
@@ -895,44 +1047,50 @@ async def handle_group_chat(message: Message):
     if (now - last_poll_time[chat_id]) / 3600 >= random.uniform(POLL_EVENT_MIN_HOURS, POLL_EVENT_MIN_HOURS + 10) and len(gdata.get("known_tags", [])) >= 2:
         asyncio.create_task(trigger_group_poll(chat_id))
 
+    # ОТВЕТ СТРОГО НА РЕПЛАЙ ИЛИ ЗОВ
     if is_mentioned or is_reply_to_bot or is_named:
         if now < muted_until[chat_id]:
             return
         call_timestamps[chat_id] = [t for t in call_timestamps[chat_id] if now - t < 120] + [now]
         if len(call_timestamps[chat_id]) > SPAM_LIMIT_MESSAGES:
             muted_until[chat_id] = now + 240
-            await message.reply("да отъебитесь вы нахуй, я срать отошёл")
+            await message.reply("да подождите вы, я отошёл на пару минут")
             return
 
         proactive_counters[chat_id] = 0
         img_b64, m_type = await extract_visual_base64(message) if has_visual else (None, "")
         task = ""
 
+        lookup_text = text_lower.replace("ё", "е")
         if any(aw in text_lower for aw in ["на базе какого", "какого ии", "ты ии", "ты бот", "прикольный ии", "нейросеть", "chatgpt", "гпт", "промпт"]):
-            task = "Тебя подозревают в том, что ты ИИ. Ответь как живой пацан с юмором и матом."
-        elif any(nt in text_lower for nt in NEWS_TRIGGERS):
-            news_summary = await fetch_fresh_news(raw_text)
-            if news_summary:
-                task = f"Свежие новости по теме: [{news_summary}]. Коротко прокомментируй по-пацански!"
+            task = "Тебя подозревают в том, что ты ИИ. Ответь с ухмылкой как обычный живой пацан."
         elif any(kw in text_lower for kw in ["рассуди", "кто прав", "разрули"]):
-            task = "Коротко в 1 предложении рассуди пацанов."
+            task = "Коротко рассуди пацанов по сути их спора."
         elif any(kw in text_lower for kw in ["че тут было", "чё тут было", "че пропустил", "о чем базар"]):
-            task = "В 1 предложении перескажи суть последних сообщений."
+            task = "Коротко перескажи, о чём шла речь в последних сообщениях."
+        elif any(nt in text_lower for nt in NEWS_TRIGGERS) or LOOKUP_RE.search(lookup_text):
+            info = await web_lookup(raw_text)
+            if info:
+                task = (f"Данные из интернета (могут быть неполными или не по теме, тогда игнорируй): [{info}]. "
+                        "Ответь по сути своими словами, 1-3 коротких фразы, с характером. Не добавляй фактов, которых тут нет.")
+            else:
+                task = "Данных из интернета найти не удалось. Если не уверен в фактах, честно скажи что не в курсе."
 
-        reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, custom_title, task, img_b64, m_type, replied_to_exact)
+        reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, task, img_b64, m_type, replied_to_exact)
         await send_human_like_reply(message, reply)
         return
 
+    # РЕДКИЙ САМОСТОЯТЕЛЬНЫЙ КОММЕНТАРИЙ (раз в 30-45 сообщений)
     if (
         now >= muted_until[chat_id]
         and proactive_counters[chat_id] >= next_proactive_target[chat_id]
         and not is_reply_to_other
-        and len(raw_text) > 12
+        and len(raw_text) > 15
     ):
         proactive_counters[chat_id] = 0
         next_proactive_target[chat_id] = random.randint(PROACTIVE_MIN_MSGS, PROACTIVE_MAX_MSGS)
         img_b64, m_type = await extract_visual_base64(message) if has_visual else (None, "")
-        reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, custom_title, "Коротко вставь свои 5 копеек по теме сообщения.", img_b64, m_type)
+        reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, "Спокойно и в тему вставь свои 5 копеек или задай встречный вопрос.", img_b64, m_type)
         await send_human_like_reply(message, reply)
 
 
@@ -946,7 +1104,7 @@ async def dead_chat_reviver():
             cid = int(cid_str)
             if (now - last_activity_time[cid]) / 3600 >= SILENCE_HOURS_TO_REVIVE and not revive_sent[cid]:
                 revive_sent[cid] = True
-                reply = await generate_phil_reply(cid, "Тишина", speaker_key="Чат", special_task="В чате тихо. Закинь короткий вопрос.")
+                reply = await generate_phil_reply(cid, "Тишина", speaker_key="Чат", special_task="В чате давно никто не писал. Закинь короткий жизненный вопрос пацанам.")
                 if reply:
                     clean = clean_phil_text(re.sub(r"\[(СТИКЕР|ГИФКА)\s*:\s*[^\]]+\]", "", reply), chat_id=cid)
                     try:
@@ -956,7 +1114,7 @@ async def dead_chat_reviver():
 
 
 async def health_check(request):
-    return web.Response(text=f"Phil v10 Alive | {BASE_URL} | {CHAT_MODEL}")
+    return web.Response(text=f"Phil v12 | {BASE_URL} | {CHAT_MODEL}")
 
 
 async def start_web_server():
