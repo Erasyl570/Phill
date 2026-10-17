@@ -1,4 +1,3 @@
-# === ЧАСТЬ 1 ИЗ 2 ===
 import asyncio
 import base64
 import io
@@ -9,7 +8,6 @@ import random
 import re
 import time
 from collections import defaultdict, deque
-from datetime import datetime, timedelta, timezone
 from urllib.parse import quote_plus
 import aiohttp
 from aiohttp import web
@@ -35,17 +33,20 @@ BOT_NAMES = ["фил", "филл", "филя", "филип", "барбос"]
 
 REACTION_CHANCE = 0.05
 DOSSIER_USE_CHANCE = 0.05
-LEARN_EVERY_N_MESSAGES = 30
+LEARN_EVERY_N_MESSAGES = 35
 SPAM_LIMIT_MESSAGES = 14
+PROACTIVE_MIN_MSGS = 25
+PROACTIVE_MAX_MSGS = 35
+SILENCE_HOURS_TO_REVIVE = 18
+POLL_EVENT_MIN_HOURS = 12
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0.0.0 Safari/537.36"}
 API_KEY = PRIMARY_DARKAPI_KEY
 BASE_URL = PRIMARY_DARKAPI_URL
 ai_client = AsyncOpenAI(api_key=API_KEY, base_url=BASE_URL, default_headers=BROWSER_HEADERS)
 
-# Приоритет Qwen, при лимите — DeepSeek
 PREFERRED_PRIMARY_MODELS = ["qwen", "deepseek-v4-pro", "deepseek", "claude-sonnet"]
-PREFERRED_FALLBACK_MODELS = ["deepseek", "glm", "gpt-oss-120b"]
+PREFERRED_FALLBACK_MODELS = ["deepseek-v4-pro", "deepseek", "glm-5.3", "gpt-oss-120b"]
 
 CHAT_MODEL = "deepseek-v4-pro"
 ANALYZER_MODEL = "deepseek-v4.1-flash"
@@ -54,7 +55,7 @@ AVAILABLE_MODELS = []
 BAD_MODELS = ("allam", "whisper", "orpheus", "guard", "tts", "embedding", "safeguard", "arabic")
 DARKAPI_FALLBACK_MODELS = [
     "qwen/qwen3.8-27b", "deepseek-v4-pro", "deepseek-v4.1-flash",
-    "claude-sonnet-5.5", "glm-5.3", "gpt-6.1-sol",
+    "claude-sonnet-5.5", "claude-haiku-5.5", "glm-5.3", "gpt-6.1-sol",
 ]
 
 bot = Bot(token=TELEGRAM_TOKEN)
@@ -63,14 +64,19 @@ dp = Dispatcher()
 chat_history = defaultdict(lambda: deque(maxlen=20))
 user_only_history = defaultdict(lambda: deque(maxlen=10))
 message_counters = defaultdict(int)
+proactive_counters = defaultdict(int)
+next_proactive_target = defaultdict(lambda: random.randint(PROACTIVE_MIN_MSGS, PROACTIVE_MAX_MSGS))
 last_activity_time = defaultdict(lambda: time.time())
+last_poll_time = defaultdict(lambda: time.time())
+revive_sent = defaultdict(bool)
 last_sent_media_uid = defaultdict(str)
 last_reply_had_blya = defaultdict(bool)
+last_reply_had_ahah = defaultdict(bool)
 call_timestamps = defaultdict(list)
 muted_until = defaultdict(float)
 user_titles_cache = {}
 
-admin_state = {"action": None, "target_chat": None, "pending_json": None}
+admin_state = {"action": None, "target_chat": None}
 MEMORY_FILE = "brain.json"
 brain = {"groups": {}, "selected_model": None, "api_keys": []}
 
@@ -97,7 +103,7 @@ def detect_url_for_key(key: str) -> str:
 
 def get_key_pool() -> list[dict]:
     pool, seen = [], set()
-    raw_keys = [PRIMARY_DARKAPI_KEY] + brain.get("api_keys", [])
+    raw_keys = brain.get("api_keys", []) + [PRIMARY_DARKAPI_KEY]
     if ENV_BACKUP_KEY:
         raw_keys.append(ENV_BACKUP_KEY)
     for k in raw_keys:
@@ -138,10 +144,9 @@ async def init_ai_models(force_key: str | None = None):
     if not connected:
         return
 
-    # Приоритет Qwen для умных ответов
-    qwen_found = next((m for m in AVAILABLE_MODELS if "qwen" in m.lower() and "image" not in m.lower()), None)
-    if qwen_found:
-        CHAT_MODEL = qwen_found
+    saved = brain.get("selected_model")
+    if saved and saved in AVAILABLE_MODELS and not any(b in saved.lower() for b in BAD_MODELS):
+        CHAT_MODEL = saved
     else:
         for pref in PREFERRED_PRIMARY_MODELS:
             found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
@@ -150,8 +155,9 @@ async def init_ai_models(force_key: str | None = None):
                 break
         else:
             CHAT_MODEL = AVAILABLE_MODELS[0]
+        brain["selected_model"] = CHAT_MODEL
 
-    for pref in ["deepseek-v4.1-flash", "flash", "haiku", "luna", "glm"]:
+    for pref in ["deepseek-v4.1-flash", "flash", "haiku", "luna", "glm", "deepseek"]:
         found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
         if found:
             ANALYZER_MODEL = found
@@ -159,7 +165,7 @@ async def init_ai_models(force_key: str | None = None):
     else:
         ANALYZER_MODEL = CHAT_MODEL
 
-    for pref in ["sonnet", "haiku", "claude", "scout", "vision", "vl"]:
+    for pref in ["sonnet", "haiku", "claude", "scout", "vision", "vl", "gpt-6"]:
         found = next((m for m in AVAILABLE_MODELS if pref in m.lower() and "image" not in m.lower()), None)
         if found:
             VISION_MODEL = found
@@ -168,15 +174,30 @@ async def init_ai_models(force_key: str | None = None):
         VISION_MODEL = CHAT_MODEL
 
 
+async def switch_to_next_key_on_limit() -> bool:
+    pool = get_key_pool()
+    other = [p["key"] for p in pool if p["key"] != API_KEY]
+    if not other:
+        return False
+    await init_ai_models(force_key=other[0])
+    return True
+
+
 async def switch_to_deepseek_on_limit() -> bool:
-    """При лимите на Qwen автоматически переключает модель на DeepSeek."""
     global CHAT_MODEL
-    deepseek_models = [m for m in AVAILABLE_MODELS if "deepseek" in m.lower()]
-    if deepseek_models:
-        CHAT_MODEL = deepseek_models[0]
-        logging.warning(f"🔄 Лимит Qwen исчерпан! Авто-переключение на DeepSeek: {CHAT_MODEL}")
+    if "qwen" in CHAT_MODEL.lower():
+        for m in AVAILABLE_MODELS:
+            if "deepseek" in m.lower() and "image" not in m.lower():
+                CHAT_MODEL = m
+                logging.warning(f"Лимит Qwen! Переключился на DeepSeek: {CHAT_MODEL}")
+                return True
+    if await switch_to_next_key_on_limit():
+        for m in AVAILABLE_MODELS:
+            if "deepseek" in m.lower() and "image" not in m.lower():
+                CHAT_MODEL = m
+                break
         return True
-    return await switch_to_next_key_on_limit()
+    return False
 
 
 def get_group_data(chat_id: int, title: str = "Группа") -> dict:
@@ -185,7 +206,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
         brain["groups"][cid] = {
             "title": title, "mode": "normal",
             "vibe": "Пацанский чат на чилле, с юмором и матом.",
-            "slang": [], "users": {}, "memes": [], "stickers": [], "gifs": [],
+            "slang": [], "users": {}, "memes": [], "stickers": [], "gifs": [], "known_tags": [],
         }
     g = brain["groups"][cid]
     if title and title != "Группа":
@@ -193,7 +214,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
     for k, v in [
         ("mode", "normal"), ("vibe", "Пацанский чат"),
         ("slang", []), ("users", {}), ("memes", []),
-        ("stickers", []), ("gifs", []),
+        ("stickers", []), ("gifs", []), ("known_tags", []),
     ]:
         g.setdefault(k, v)
     return g
@@ -265,7 +286,7 @@ async def get_user_custom_title(chat_id: int, user_id: int) -> str:
 
 
 async def fetch_fresh_news(query_text: str) -> str:
-clean_q = re.sub(r"\b(фил|филл|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире)\b", "", query_text, flags=I := re.I).strip(" ?!.,")
+    clean_q = re.sub(r"\b(фил|филл|слышал|знаешь|че|чё|там|про|новость|новости|случилось|произошло|в|мире)\b", "", query_text, flags=re.I).strip(" ?!.,")
     url = f"https://news.google.com/rss/search?q={quote_plus(clean_q)}&hl=ru&gl=RU&ceid=RU:ru" if len(clean_q) > 2 else "https://news.google.com/rss?hl=ru&gl=RU&ceid=RU:ru"
     try:
         async with aiohttp.ClientSession() as session:
@@ -306,6 +327,8 @@ def get_visual_target_from_msg(msg: Message) -> tuple[str | None, str]:
         return msg.animation.file_id, "гифка"
     if msg.video and msg.video.thumbnail:
         return msg.video.thumbnail.file_id, "видеоролик"
+    if msg.video_note and msg.video_note.thumbnail:
+        return msg.video_note.thumbnail.file_id, "видео-кружочек"
     return None, ""
 
 
@@ -342,7 +365,7 @@ async def analyze_and_remember_media(chat_id: int, media_obj, kind: str, context
                 resp = await ai_client.chat.completions.create(
                     model=VISION_MODEL or CHAT_MODEL,
                     messages=[{"role": "user", "content": [
-                        {"type": "text", "text": f"Опиши этот {kind} в 5 словах: эмоция и текст."},
+                        {"type": "text", "text": f"Опиши этот {kind} в 5 словах: какая эмоция и какой текст написан."},
                         {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
                     ]}],
                     temperature=0.2, max_tokens=40,
@@ -379,11 +402,16 @@ def clean_phil_text(text: str, chat_id: int = 0) -> str:
         text = re.sub(r"^\s*(бля|блять)[\s,!?.]+", "", text, flags=re.I)
         text = re.sub(r"[\s,]+(бля|блять)[!?.]*\s*$", "", text, flags=re.I)
 
+    if last_reply_had_ahah[chat_id] or random.random() < 0.65:
+        text = re.sub(r"^\s*(ахах[ах]*|хаха[ха]*|пхах[ах]*)[\s,!?.]+", "", text, flags=re.I)
+
     blya_matches = list(re.finditer(r"\b(бля|блять)\b", text, flags=re.I))
     if len(blya_matches) > 1:
         for m in reversed(blya_matches[1:]):
             text = text[:m.start()] + text[m.end():]
+
     last_reply_had_blya[chat_id] = bool(re.search(r"\b(бля|блять)\b", text, flags=re.I))
+    last_reply_had_ahah[chat_id] = bool(re.search(r"\b(ахах|хаха)", text, flags=re.I))
 
     text = re.sub(r"^\s*(да|не|ну|бля|блять|ебать|слышь|короче|ладно|ало|э|эй)\s*,\s*", r"\1 ", text, flags=re.I)
     cleaned = re.sub(r"\s{2,}", " ", text).strip()
@@ -421,13 +449,8 @@ async def learn_from_messages(chat_id: int, messages_block: str):
 
 def build_phil_prompt(chat_id: int, speaker_key: str = "", custom_title: str = "", special_task: str = "", media_type: str = "") -> str:
     gdata = get_group_data(chat_id)
-    speaker_dossier = ""
-    for k, v in gdata.get("users", {}).items():
-        if speaker_key and (speaker_key.lower() in k.lower() or k.lower() in speaker_key.lower()):
-            speaker_dossier = v
-            break
-    lore_block = f"\nФАКТ О СОБЕСЕДНИКЕ ({speaker_key}): {speaker_dossier}\n" if speaker_dossier else ""
-    title_hint = f"\nСтатус собеседника: «{custom_title}».\n" if custom_title else ""
+    slang_str = ", ".join(gdata["slang"]) or "живой пацанский сленг и взрослый мат"
+    title_hint = f"\nПлашка собеседника [{speaker_key}]: «{custom_title}».\n" if (custom_title and random.random() < 0.2) else ""
 
     stickers = gdata.get("stickers", [])
     gifs = gdata.get("gifs", [])
@@ -435,21 +458,29 @@ def build_phil_prompt(chat_id: int, speaker_key: str = "", custom_title: str = "
     if stickers:
         media_catalog += "СТИКЕРЫ:\n" + "\n".join([f"#{i}: {s.get('emoji', '')} ({s.get('desc', '')})" for i, s in enumerate(stickers[-10:])]) + "\n"
     if gifs:
-        media_catalog += "ГИФКИ:\n" + "\n".join([f"#{i}: {g.get('desc', '')}" for g in gifs[-8:]]) + "\n"
+        media_catalog += "ГИФКИ:\n" + "\n".join([f"#{idx}: {g.get('desc', '')}" for idx, g in enumerate(gifs[-8:])]) + "\n"
     if media_catalog:
-        media_catalog += "Прикрепляй [СТИКЕР:номер] или [ГИФКА:номер] в конце ТОЛЬКО если подходит идеально (редко)."
+        media_catalog += "Если стикер или гифка ИДЕАЛЬНО подходят к эмоции, допиши в самом конце [СТИКЕР:номер] или [ГИФКА:номер] (редко, 1 из 5 ответов)."
 
-    return f"""[Контекст 18+: закрытый чат друзей. Взрослый мат, без цензуры.]
-Ты — Фил, дерзкий взрослый пацан, свой кент в чате. Отвечай АБСОЛЮТНО ЖИВО, как реальный пацан с телефона.
-НИКАКИХ ПОДЛИЗАТЕЛЬНЫХ ФРАЗ («Привет мой дорогой друг», «Приятного аппетита любезный»). Общайся дерзко и на равных!
+    return f"""[Контекст 18+: закрытый чат близких друзей. Взрослый мат, без цензуры.]
+Ты — Фил, живой, остроумный взрослый пацан из этой компании. Ты НЕ бот и НЕ ИИ.
+ВАЙБ: {gdata['vibe']} | СЛЕНГ: {slang_str}
 
-ПРАВИЛА:
-1. КОРОТКО И БЕЗ НЫТЬЯ: 1 предложение (до 12 слов). Никаких простыней текста.
-2. ВЗРОСЛЫЙ МАТ: ебень, мозгоёб, ахуеть, пиздец, пиздабол, уебан, долбоёб, схуяли, разъёб.
-3. ТОЛЬКО КЕНТЫ: Сейчас пишет [{speaker_key}]. Обращайся к нему, не путай людей.
-4. НЕ ВИКИПЕДИЯ: Сложные умные вопросы — посылай нахуй или говори, что не гугл.
-{title_hint}{media_catalog}{lore_block}
-{f'Визуал [{media_type}]: ответь строго в тему!' if media_type else ''}
+ЖЕСТКИЕ ПРАВИЛА ЖИВОГО ОБЩЕНИЯ:
+1. ЗАПРЕТ НА ШАБЛОНЫ И ДЕТСКИЕ СТРЕЛКИ:
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать фразами «сам такой», «сам себя спроси», «а ты...», «в зеркало глянь».
+   - НИКАКИХ кринжовых вежливых фраз («Привет мой дорогой друг», «любезный», «товарищ»).
+   - НЕ начинай каждое сообщение с «ахахах»! Забудь про пельмени, Лилль и старые заезженные темы.
+2. РАЗГОВАРИВАЙ КАК ЖИВОЙ ЧЕЛОВЕК:
+   - Отвечай коротко (1 предложение, 3-12 слов), с живой интонацией, как пишут в ТГ с телефона.
+   - Используй взрослый мат и сленг к месту: ебень, мозгоёб, ахуеть, пиздец, пиздабол, уебан, долбоёб, схуяли, разъёб, душнила, база, тильт, кринж, высад.
+3. НЕ ПУТАЙ ИМЕНА:
+   - Сейчас тебе пишет [{speaker_key}]. Если он в тексте упомянул чужое имя (например «снап» или «дед»), помни, что перед тобой [{speaker_key}], а НЕ тот, о ком он говорит!
+4. РОДНЫЕ И ВОПРОСЫ:
+   - Если кто-то жёстко задел чью-то мать/родных — коротко и жёстко осади шутника (разрешено пройтись по его родным в ответ).
+   - На сложные энциклопедические вопросы отвечай, что ты не гугл и в душе не ебёшь.
+{title_hint}{media_catalog}
+{f'Визуал [{media_type}]: оцени кадр/надпись и ответь строго в тему!' if media_type else ''}
 {f'ЗАДАЧА: {special_task}' if special_task else ''}"""
 
 
@@ -470,21 +501,20 @@ async def generate_phil_reply(
         user_content = user_prompt
         models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
-    for attempt in range(2):
+    for _ in range(2):
         for model_name in list(dict.fromkeys(m for m in models_to_try if m))[:3]:
             try:
                 resp = await ai_client.chat.completions.create(
                     model=model_name,
                     messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                    temperature=0.7, top_p=0.88, max_tokens=150,
+                    temperature=0.68, top_p=0.88, max_tokens=150,
                 )
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
                     return reply
             except Exception as e:
-                err_str = str(e)
-                if any(code in err_str for code in ("429", "402", "401")):
+                if any(code in str(e) for code in ("429", "402", "401")):
                     if await switch_to_deepseek_on_limit():
                         models_to_try = [CHAT_MODEL]
                         break
@@ -526,113 +556,11 @@ async def send_human_like_reply(message: Message, reply_text: str, incoming_medi
                 await (bot.send_animation(chat_id=chat_id, animation=gf_id) if clean_text else message.reply_animation(animation=gf_id))
             except Exception:
                 pass
-                # === ЧАСТЬ 2 ИЗ 2 ===
-
-PROACTIVE_MIN_MSGS = 25          # Пишет сам по себе редко: раз в 25-35 сообщений
-PROACTIVE_MAX_MSGS = 35
-SILENCE_HOURS_TO_REVIVE = 18
-POLL_EVENT_MIN_HOURS = 12
-
-proactive_counters = defaultdict(int)
-next_proactive_target = defaultdict(lambda: random.randint(PROACTIVE_MIN_MSGS, PROACTIVE_MAX_MSGS))
-last_poll_time = defaultdict(lambda: time.time())
-revive_sent = defaultdict(bool)
-last_reply_had_ahah = defaultdict(bool)
-
-
-async def switch_to_next_key_on_limit() -> bool:
-    pool = get_key_pool()
-    other = [p["key"] for p in pool if p["key"] != API_KEY]
-    if not other:
-        return False
-    await init_ai_models(force_key=other[0])
-    return True
-
-
-async def switch_to_deepseek_on_limit() -> bool:
-    """Если Qwen упёрся в лимит — мгновенно переключаем модель или ключ на DeepSeek."""
-    global CHAT_MODEL
-    if "qwen" in CHAT_MODEL.lower():
-        for m in AVAILABLE_MODELS:
-            if "deepseek" in m.lower() and "image" not in m.lower():
-                CHAT_MODEL = m
-                logging.warning(f"🔄 Лимит Qwen! Переключился на DeepSeek: {CHAT_MODEL}")
-                return True
-    if await switch_to_next_key_on_limit():
-        for m in AVAILABLE_MODELS:
-            if "deepseek" in m.lower() and "image" not in m.lower():
-                CHAT_MODEL = m
-                break
-        return True
-    return False
-
-
-# Переопределяем очистку текста и промпт, чтобы убрать спам «ахахах», стрелки и путаницу имён
-def clean_phil_text(text: str, chat_id: int = 0) -> str:
-    if not text:
-        return ""
-    if last_reply_had_blya[chat_id] or random.random() < 0.7:
-        text = re.sub(r"^\s*(бля|блять)[\s,!?.]+", "", text, flags=re.I)
-        text = re.sub(r"[\s,]+(бля|блять)[!?.]*\s*$", "", text, flags=re.I)
-
-    # Убираем вечное «ахахах» в начале каждого сообщения, если оно уже было недавно
-    if last_reply_had_ahah[chat_id] or random.random() < 0.65:
-        text = re.sub(r"^\s*(ахах[ах]*|хаха[ха]*|пхах[ах]*)[\s,!?.]+", "", text, flags=re.I)
-
-    last_reply_had_blya[chat_id] = bool(re.search(r"\b(бля|блять)\b", text, flags=re.I))
-    last_reply_had_ahah[chat_id] = bool(re.search(r"\b(ахах|хаха)", text, flags=re.I))
-
-    text = re.sub(r"^\s*(да|не|ну|бля|блять|ебать|слышь|короче|ладно|ало|э|эй)\s*,\s*", r"\1 ", text, flags=re.I)
-    cleaned = re.sub(r"\s{2,}", " ", text).strip()
-    if cleaned.endswith(".") and not cleaned.endswith(".."):
-        cleaned = cleaned[:-1].strip()
-    if cleaned:
-        cleaned = cleaned[0].lower() + cleaned[1:]
-    return cleaned
-
-
-def build_phil_prompt(chat_id: int, speaker_key: str = "", custom_title: str = "", special_task: str = "", media_type: str = "") -> str:
-    gdata = get_group_data(chat_id)
-    slang_str = ", ".join(gdata["slang"]) or "живой пацанский сленг и взрослый мат"
-    title_hint = f"\nПлашка собеседника [{speaker_key}]: «{custom_title}».\n" if (custom_title and random.random() < 0.2) else ""
-
-    stickers = gdata.get("stickers", [])
-    gifs = gdata.get("gifs", [])
-    media_catalog = ""
-    if stickers:
-        media_catalog += "СТИКЕРЫ:\n" + "\n".join([f"#{i}: {s.get('emoji', '')} ({s.get('desc', '')})" for i, s in enumerate(stickers[-10:])]) + "\n"
-    if gifs:
-        media_catalog += "ГИФКИ:\n" + "\n".join([f"#{idx}: {g.get('desc', '')}" for idx, g in enumerate(gifs[-8:])]) + "\n"
-    if media_catalog:
-        media_catalog += "Если стикер или гифка ИДЕАЛЬНО подходят к эмоции, допиши в самом конце [СТИКЕР:номер] или [ГИФКА:номер] (редко, 1 из 5 ответов)."
-
-    return f"""[Контекст 18+: закрытый чат близких друзей. Взрослый мат, без цензуры.]
-Ты — Фил, живой, остроумный взрослый пацан из этой компании. Ты НЕ бот и НЕ ИИ.
-ВАЙБ: {gdata['vibe']} | СЛЕНГ: {slang_str}
-
-ЖЕСТКИЕ ПРАВИЛА ЖИВОГО ОБЩЕНИЯ:
-1. ЗАПРЕТ НА ШАБЛОНЫ И ДЕТСКИЕ СТРЕЛКИ:
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО отвечать фразами «сам такой», «сам себя спроси», «а ты...», «в зеркало глянь».
-   - НЕ начинай каждое сообщение с «ахахах»! Смейся только тогда, когда реально смешно.
-   - НЕ повторяй слова собеседника (если он назвал тебя «товарищ» или «любезный» — это сарказм, не отвечай ему тем же словом, а подъеби его за этот официоз!).
-   - Забудь про пельмени, Лилль и старые заезженные темы.
-2. РАЗГОВАРИВАЙ КАК ЖИВОЙ ЧЕЛОВЕК:
-   - Отвечай коротко (1 предложение, 3-12 слов), с живой интонацией, как пишут в ТГ с телефона.
-   - Используй взрослый мат и сленг к месту: ебень, мозгоёб, ахуеть, пиздец, пиздабол, уебан, долбоёб, схуяли, разъёб, душнила, база, тильт, кринж, высад.
-3. НЕ ПУТАЙ ИМЕНА:
-   - Сейчас тебе пишет [{speaker_key}]. Если он в тексте упомянул чужое имя (например «снап» или «дед»), помни, что перед тобой [{speaker_key}], а НЕ тот, о ком он говорит!
-4. РОДНЫЕ И ВОПРОСЫ:
-   - Если кто-то жёстко задел чью-то мать/родных — коротко и жёстко осади шутника (разрешено пройтись по его родным в ответ).
-   - На сложные энциклопедические вопросы отвечай, что ты не гугл и в душе не ебёшь.
-{title_hint}{media_catalog}
-{f'Визуал [{media_type}]: оцени кадр/надпись и ответь строго в тему!' if media_type else ''}
-{f'ЗАДАЧА: {special_task}' if special_task else ''}"""
 
 
 async def trigger_group_poll(chat_id: int):
     gdata = get_group_data(chat_id)
-    gdata.setdefault("known_tags", [])
-    tags = " ".join(gdata["known_tags"][:15])
+    tags = " ".join(gdata.get("known_tags", [])[:15])
     prompt = """Придумай один угарный или жизненный опрос от лица Фила для пацанского чата (например «кто сегодня главный гей чата», «кто первый сольётся», «кто че вечером мутит»).
 Верни ТОЛЬКО JSON: {"intro": "короткий вброс с матом", "question": "вопрос", "options": ["вар 1", "вар 2", "вар 3", "вар 4"]}"""
     try:
@@ -652,8 +580,6 @@ async def trigger_group_poll(chat_id: int):
     except Exception:
         pass
 
-
-# --- КОМАНДА /code И ПАНЕЛЬ В ЛИЧКЕ ---
 
 async def send_code_file_to_admin(chat_id: int):
     try:
@@ -700,7 +626,7 @@ async def admin_panel_cmd(message: Message):
     admin_state["action"] = None
     await message.answer(
         f"🕵️‍♂️ <b>Тайная канцелярия Фила</b>\nСервер: <code>{BASE_URL}</code>\nМодель: <code>{CHAT_MODEL}</code>\n"
-        f"💡 Скинь сюда ключ <code>gsk_...</code> от Groq (для Qwen) или <code>tc_live_...</code> (для DeepSeek) — при лимите бот сам переключится с Qwen на DeepSeek!",
+        f"Команда <code>/code</code> пришлёт готовый файл <b>bot.py</b> прямо сюда!",
         reply_markup=build_groups_keyboard("grp"), parse_mode="HTML",
     )
 
@@ -868,8 +794,6 @@ async def handle_private_text(message: Message):
     await handle_admin_ai_assistant(message)
 
 
-# --- ОБРАБОТКА ГРУППОВЫХ СООБЩЕНИЙ (ТОЛЬКО НА РЕПЛАЙ И ЗОВ + РЕДКИЙ ВРЫВ) ---
-
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_chat(message: Message):
     if message.from_user and message.from_user.is_bot:
@@ -884,7 +808,6 @@ async def handle_group_chat(message: Message):
         return
 
     gdata = get_group_data(chat_id, message.chat.title or "Группа")
-    gdata.setdefault("known_tags", [])
     now = time.time()
     last_activity_time[chat_id] = now
     revive_sent[chat_id] = False
@@ -913,7 +836,6 @@ async def handle_group_chat(message: Message):
         if r_body:
             replied_to_exact = f"{replied_user_name}: {r_body}"
 
-    # 1. Стикеры (отвечает ТОЛЬКО если стикером реплайнули самому Филу)
     if message.sticker:
         prev_ctx = replied_to_exact or (chat_history[chat_id][-1] if chat_history[chat_id] else "")
         s_desc = await analyze_and_remember_media(chat_id, message.sticker, "sticker", prev_ctx)
@@ -925,7 +847,6 @@ async def handle_group_chat(message: Message):
             await send_human_like_reply(message, reply, incoming_media_uid=message.sticker.file_unique_id)
         return
 
-    # 2. Гифки / видео / фото
     has_media = bool(message.animation or message.photo or message.video or message.video_note)
     if message.animation:
         prev_ctx = replied_to_exact or (chat_history[chat_id][-1] if chat_history[chat_id] else "")
@@ -973,7 +894,6 @@ async def handle_group_chat(message: Message):
     if (now - last_poll_time[chat_id]) / 3600 >= random.uniform(POLL_EVENT_MIN_HOURS, POLL_EVENT_MIN_HOURS + 10) and len(gdata.get("known_tags", [])) >= 2:
         asyncio.create_task(trigger_group_poll(chat_id))
 
-    # 3. ОТВЕЧАЕТ СТРОГО НА РЕПЛАЙ ИЛИ ЗОВ ПО ИМЕНИ/ТЕГУ
     if is_mentioned or is_reply_to_bot or is_named:
         if now < muted_until[chat_id]:
             return
@@ -1002,7 +922,6 @@ async def handle_group_chat(message: Message):
         await send_human_like_reply(message, reply)
         return
 
-    # 4. РЕДКИЙ САМОСТОЯТЕЛЬНЫЙ ВРЫВ (раз в 25-35 сообщений, и ТОЛЬКО если пацаны не общаются реплаями друг с другом)
     if (
         now >= muted_until[chat_id]
         and proactive_counters[chat_id] >= next_proactive_target[chat_id]
