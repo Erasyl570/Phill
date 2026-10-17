@@ -84,9 +84,14 @@ class SinglePollerDispatcher(Dispatcher):
             try:
                 updates = await bot(request, request_timeout=polling_timeout + 10)
             except TelegramConflictError:
-                logging.critical("Telegram 409: другой экземпляр использует getUpdates или включён webhook. "
-                                 "Остановите старый сервис/worker и оставьте одну реплику.")
-                raise
+                logging.warning("Telegram 409: другой экземпляр использует getUpdates или включён webhook. "
+                                "Жду 15с, удаляю webhook и пробую снова (Render zero-downtime overlap).")
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(15)
+                continue
             except TelegramUnauthorizedError:
                 logging.critical("Telegram отклонил токен: проверьте TELEGRAM_TOKEN запущенного сервиса.")
                 raise
@@ -1167,13 +1172,31 @@ async def main():
         await start_web_server()
         # Fail before launching background work if the token is invalid.
         await bot.me()
-        await bot.delete_webhook(drop_pending_updates=False)
+        await bot.delete_webhook(drop_pending_updates=True)
         await load_brain()
         await init_ai_models()
         if not AVAILABLE_MODELS or not CHAT_MODEL:
             raise RuntimeError("Нет доступной модели: проверьте ключ API и AI_MODEL")
         tasks = [asyncio.create_task(dead_chat_reviver()), asyncio.create_task(keep_alive())]
-        await dp.start_polling(bot, close_bot_session=False)
+
+        # Retry loop — критично для Render: при деплое 10-20с работают 2 инстанса, будет 409
+        retry_delay = 5
+        while True:
+            try:
+                logging.info("🚀 Start polling @phillchatbot")
+                await dp.start_polling(bot, close_bot_session=False)
+                break
+            except TelegramConflictError:
+                logging.warning(f"⚠️ 409 Conflict — другой инстанс еще жив. Retry через {retry_delay}с")
+                try:
+                    await bot.delete_webhook(drop_pending_updates=True)
+                except Exception:
+                    pass
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 1.5, 60)
+            except TelegramUnauthorizedError:
+                logging.critical("Telegram токен неверный — проверь TELEGRAM_TOKEN")
+                raise
     finally:
         for task in tasks:
             task.cancel()
