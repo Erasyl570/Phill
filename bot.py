@@ -52,7 +52,8 @@ POLL_EVENT_MIN_HOURS = 14
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0.0.0 Safari/537.36"}
 API_KEY = ENV_BACKUP_KEY or PRIMARY_DARKAPI_KEY
 BASE_URL = PRIMARY_DARKAPI_URL
-ai_client = AsyncOpenAI(api_key=API_KEY or "not-configured", base_url=BASE_URL, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
+AI_HTTP_TIMEOUT = 30.0
+ai_client = AsyncOpenAI(api_key=API_KEY or "not-configured", base_url=BASE_URL, default_headers=BROWSER_HEADERS, timeout=AI_HTTP_TIMEOUT, max_retries=0)
 
 # Строгий приоритет: сначала Qwen, а при лимите или сбое — DeepSeek / Claude
 PREFERRED_PRIMARY_MODELS = ["qwen", "deepseek-v4-pro", "deepseek", "claude-sonnet"]
@@ -90,7 +91,7 @@ class SinglePollerDispatcher(Dispatcher):
                 wait = random.uniform(2.5, 4.5)
                 logging.warning(f"Telegram 409: другой инстанс активен. Жду {wait:.1f}с и удаляю webhook...")
                 try:
-                    await bot.delete_webhook(drop_pending_updates=True)
+                    await bot.delete_webhook(drop_pending_updates=False)
                 except Exception:
                     pass
                 await asyncio.sleep(wait)
@@ -194,7 +195,7 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
         test_client = None
         k, url = item["key"], item["url"]
         try:
-            test_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
+            test_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=AI_HTTP_TIMEOUT, max_retries=0)
             models_resp = await asyncio.wait_for(test_client.models.list(), timeout=8)
             clean_ids = [m.id for m in models_resp.data if not any(b in m.id.lower() for b in BAD_MODELS)]
             if clean_ids:
@@ -209,7 +210,7 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
             logging.warning("Проверка %s: %s", url, type(e).__name__)
             if k.startswith("tc_"):
                 API_KEY, BASE_URL = k, url
-                ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=12.0, max_retries=0)
+                ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=AI_HTTP_TIMEOUT, max_retries=0)
                 AVAILABLE_MODELS = [ENV_MODEL] if ENV_MODEL else []
                 logging.error("Каталог моделей недоступен: задайте точный AI_MODEL или восстановите /models")
                 connected = True
@@ -647,7 +648,12 @@ async def generate_phil_reply(
         model_blocked_until.clear()
         models_to_try = [m for m in dict.fromkeys([VISION_MODEL if image_b64 else "", CHAT_MODEL]) if m]
         logging.warning("Нет доступных моделей в каталоге, пробую напрямую: %s", models_to_try)
-    deadline = time.monotonic() + 28
+    fast = ANALYZER_MODEL
+    if (not image_b64 and fast and fast in AVAILABLE_MODELS and fast not in blocked_models()
+            and fast != models_to_try[0]):
+        # если тяжёлая модель тормозит, вторым пробуем быструю, а не очередную тяжёлую
+        models_to_try = list(dict.fromkeys([models_to_try[0], fast] + models_to_try))[:3]
+    deadline = time.monotonic() + 32
     for model_name in models_to_try:
         for parameter_attempt in range(2):
             remaining = deadline - time.monotonic()
@@ -662,7 +668,7 @@ async def generate_phil_reply(
                 if PENALTY_OK:
                     kwargs.update(frequency_penalty=0.2)
                 # Быстрый таймаут 7с вместо 10с — чтобы не висеть на deepseek-v4-pro
-                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(14, remaining))
+                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(15 if model_name == models_to_try[0] else 25, remaining))
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
@@ -1227,7 +1233,7 @@ async def main():
             except TelegramConflictError:
                 logging.warning(f"⚠️ 409 Conflict — другой инстанс еще жив. Retry через {retry_delay}с")
                 try:
-                    await bot.delete_webhook(drop_pending_updates=True)
+                    await bot.delete_webhook(drop_pending_updates=False)
                 except Exception:
                     pass
                 await asyncio.sleep(retry_delay)
