@@ -149,7 +149,13 @@ ai_stats = {"ok_t": 0.0, "err_t": 0.0, "err": "", "ok_n": 0, "err_n": 0}
 group_seen = defaultdict(lambda: {"n": 0, "t": 0.0})
 PENALTY_OK = True
 _lookup_cache: dict[str, tuple[float, str]] = {}
-unsupported_models: set[str] = set()
+model_blocked_until: dict[str, float] = {}  # модель -> до какого времени пропускаем
+MODEL_BLOCK_SEC = 600
+
+
+def blocked_models() -> set[str]:
+    now = time.time()
+    return {m for m, t in model_blocked_until.items() if t > now}
 
 
 def detect_url_for_key(key: str) -> str:
@@ -194,7 +200,7 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
             if clean_ids:
                 API_KEY, BASE_URL, ai_client = k, url, test_client
                 AVAILABLE_MODELS = sorted(clean_ids)
-                unsupported_models.clear()
+                model_blocked_until.clear()
                 connected = True
                 break
         except Exception as e:
@@ -635,8 +641,13 @@ async def generate_phil_reply(
         models_to_try = [CHAT_MODEL] + PREFERRED_FALLBACK_MODELS
 
     models_to_try = reply_models(CHAT_MODEL, VISION_MODEL, AVAILABLE_MODELS,
-                                 PREFERRED_FALLBACK_MODELS, unsupported_models, bool(image_b64))
-    deadline = time.monotonic() + 18  # было 22, уменьшили для быстрого фолбэка
+                                 PREFERRED_FALLBACK_MODELS, blocked_models(), bool(image_b64))
+    if not models_to_try:
+        # каталог пуст или все модели в блоке: лучше попробовать основную, чем молчать
+        model_blocked_until.clear()
+        models_to_try = [m for m in dict.fromkeys([VISION_MODEL if image_b64 else "", CHAT_MODEL]) if m]
+        logging.warning("Нет доступных моделей в каталоге, пробую напрямую: %s", models_to_try)
+    deadline = time.monotonic() + 28
     for model_name in models_to_try:
         for parameter_attempt in range(2):
             remaining = deadline - time.monotonic()
@@ -651,7 +662,7 @@ async def generate_phil_reply(
                 if PENALTY_OK:
                     kwargs.update(frequency_penalty=0.2)
                 # Быстрый таймаут 7с вместо 10с — чтобы не висеть на deepseek-v4-pro
-                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(7, remaining))
+                resp = await asyncio.wait_for(ai_client.chat.completions.create(**kwargs), timeout=min(14, remaining))
                 reply = (resp.choices[0].message.content or "").strip()
                 reply = re.sub(r"^(Фил|Филл|Ответ Фила)\s*:\s*", "", reply, flags=re.I).strip("\"'«»")
                 if reply:
@@ -660,14 +671,15 @@ async def generate_phil_reply(
             except Exception as e:
                 # Быстрый фолбэк при таймауте — не ждем 10с, сразу пробуем следующую модель
                 is_timeout = isinstance(e, (asyncio.TimeoutError, TimeoutError)) or "timeout" in type(e).__name__.lower() or "timeout" in str(e).lower()
-                logging.warning("AI ошибка [%s]: %s %s", model_name, type(e).__name__, "(таймаут, быстрый фолбэк)" if is_timeout else "")
-                ai_stats.update(err_t=time.time(), err=f"{model_name}: {type(e).__name__}", err_n=ai_stats["err_n"] + 1)
+                code = getattr(e, "status_code", None)
+                logging.warning("AI ошибка [%s]: %s %s %s", model_name, type(e).__name__, code or "", str(e)[:160])
+                ai_stats.update(err_t=time.time(), err=f"{model_name}: {type(e).__name__} {code or ''} {str(e)[:120]}".strip(), err_n=ai_stats["err_n"] + 1)
                 err = str(e).lower()
                 if PENALTY_OK and "penalty" in err and parameter_attempt == 0:
                     PENALTY_OK = False
                     continue
                 if any(code in err for code in ("unsupported_model", "model_not_found", "model not found", "does not exist")):
-                    unsupported_models.add(model_name)
+                    model_blocked_until[model_name] = time.time() + MODEL_BLOCK_SEC
                 # При 429/401 сразу прерываем попытки — нет смысла спамить
                 if getattr(e, "status_code", None) in (401, 402, 403):
                     return ""
@@ -676,6 +688,7 @@ async def generate_phil_reply(
                     continue
             break
 
+    logging.error("AI не дал ответа: моделей %s, см. /status", models_to_try)
     return ""
 
 
@@ -933,6 +946,9 @@ async def cmd_status(message: Message):
     ]
     if ai_stats["err"]:
         lines.append(f"Посл. ошибка: {ai_stats['err']}")
+    if blocked_models():
+        lines.append(f"Временно отключены: {', '.join(sorted(blocked_models()))}")
+    lines.append(f"Каталог моделей: {len(AVAILABLE_MODELS)} шт.")
     for cid, g in group_seen.items():
         mode = brain.get("groups", {}).get(str(cid), {}).get("mode", "?")
         mute = max(0, int(muted_until[cid] - time.time()))
