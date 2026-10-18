@@ -86,16 +86,10 @@ class SinglePollerDispatcher(Dispatcher):
             try:
                 updates = await bot(request, request_timeout=polling_timeout + 10)
             except TelegramConflictError:
-                # Фикс для Render: при деплое 2 инстанса живут параллельно 10-20с
-                # Делаем быстрый retry вместо 15с ожидания
-                wait = random.uniform(2.5, 4.5)
-                logging.warning(f"Telegram 409: другой инстанс активен. Жду {wait:.1f}с и удаляю webhook...")
-                try:
-                    await bot.delete_webhook(drop_pending_updates=False)
-                except Exception:
-                    pass
-                await asyncio.sleep(wait)
-                continue
+                # Не перехватываем 409 бесконечно внутри генератора: main должен
+                # увидеть конфликт и остановить/перезапустить процесс согласно политике хостинга.
+                logging.critical("Telegram 409 Conflict: другой процесс использует этот токен")
+                raise
             except TelegramUnauthorizedError:
                 logging.critical("Telegram отклонил токен: проверьте TELEGRAM_TOKEN запущенного сервиса.")
                 raise
@@ -211,8 +205,10 @@ async def init_ai_models(force_key: str | None = None, prefer_deepseek: bool = F
             if k.startswith("tc_"):
                 API_KEY, BASE_URL = k, url
                 ai_client = AsyncOpenAI(api_key=k, base_url=url, default_headers=BROWSER_HEADERS, timeout=AI_HTTP_TIMEOUT, max_retries=0)
-                AVAILABLE_MODELS = [ENV_MODEL] if ENV_MODEL else []
-                logging.error("Каталог моделей недоступен: задайте точный AI_MODEL или восстановите /models")
+                # DarkAPI иногда отвечает на chat/completions, даже когда /models недоступен.
+                # Если AI_MODEL задан — используем его; иначе пробуем известные кандидаты.
+                AVAILABLE_MODELS = [ENV_MODEL] if ENV_MODEL else list(DARKAPI_FALLBACK_MODELS)
+                logging.error("Каталог моделей DarkAPI недоступен; пробую AI_MODEL или резервные ID")
                 connected = True
                 break
         else:
@@ -1216,7 +1212,7 @@ async def main():
         await start_web_server()
         # Fail before launching background work if the token is invalid.
         await bot.me()
-        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.delete_webhook(drop_pending_updates=False)
         await load_brain()
         await init_ai_models()
         if not AVAILABLE_MODELS or not CHAT_MODEL:
@@ -1230,14 +1226,9 @@ async def main():
                 logging.info("🚀 Start polling @phillchatbot")
                 await dp.start_polling(bot, close_bot_session=False)
                 break
-            except TelegramConflictError:
-                logging.warning(f"⚠️ 409 Conflict — другой инстанс еще жив. Retry через {retry_delay}с")
-                try:
-                    await bot.delete_webhook(drop_pending_updates=False)
-                except Exception:
-                    pass
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 1.3, 15)
+            except TelegramConflictError as exc:
+                logging.critical("Telegram 409 Conflict: остановите дубликат сервиса/worker с тем же токеном")
+                raise RuntimeError("Telegram 409: обнаружен второй процесс с тем же токеном") from exc
             except TelegramUnauthorizedError:
                 logging.critical("Telegram токен неверный — проверь TELEGRAM_TOKEN")
                 raise
