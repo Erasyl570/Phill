@@ -17,7 +17,7 @@ from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    BufferedInputFile, CallbackQuery, InlineKeyboardButton,
+    BufferedInputFile, CallbackQuery, ChatMemberUpdated, InlineKeyboardButton,
     InlineKeyboardMarkup, InputMediaDocument, Message,
 )
 from openai import AsyncOpenAI
@@ -48,6 +48,9 @@ PROACTIVE_MIN_MSGS = 30
 PROACTIVE_MAX_MSGS = 45
 SILENCE_HOURS_TO_REVIVE = 18
 POLL_EVENT_MIN_HOURS = 14
+RELATIONSHIP_SAVE_EVERY = 20
+PROACTIVE_COOLDOWN_SEC = 1800
+MUTE_REPEAT_WINDOW_SEC = 7 * 24 * 3600
 
 BROWSER_HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/129.0.0.0 Safari/537.36"}
 API_KEY = ENV_BACKUP_KEY or PRIMARY_DARKAPI_KEY
@@ -117,6 +120,9 @@ last_sent_media_uid = defaultdict(str)
 last_reply_had_blya = defaultdict(bool)
 call_timestamps = defaultdict(list)
 muted_until = defaultdict(float)
+last_proactive_at = defaultdict(float)
+relationship_updates = defaultdict(int)
+poll_scheduled_until = defaultdict(float)
 
 admin_state = {"action": None, "target_chat": None}
 MEMORY_FILE = "brain.json"
@@ -296,7 +302,7 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
         brain["groups"][cid] = {
             "title": title, "mode": "normal",
             "vibe": "Обычный дружеский телеграм-чат пацанов.",
-            "slang": [], "users": {}, "memes": [], "stickers": [], "gifs": [], "known_tags": [],
+            "slang": [], "users": {}, "memes": [], "stickers": [], "gifs": [], "known_tags": [], "phil_mood": {}, "relationships": {},
         }
     g = brain["groups"][cid]
     if title and title != "Группа":
@@ -304,11 +310,47 @@ def get_group_data(chat_id: int, title: str = "Группа") -> dict:
     for k, v in [
         ("mode", "normal"), ("vibe", "Обычный дружеский телеграм-чат пацанов."),
         ("slang", []), ("users", {}), ("memes", []),
-        ("stickers", []), ("gifs", []), ("known_tags", []),
+        ("stickers", []), ("gifs", []), ("known_tags", []), ("phil_mood", {}), ("relationships", {}),
     ]:
         g.setdefault(k, v)
     sanitize_group_memory(g)
     return g
+
+
+def update_relationship(gdata: dict, user_id: int, speaker_key: str, *, called_phil: bool = False, replied_to_phil: bool = False):
+    """Track lightweight interaction patterns, not sentiment or insults."""
+    rels = gdata.setdefault("relationships", {})
+    key = str(user_id)
+    rel = rels.setdefault(key, {"name": speaker_key[:80], "messages": 0, "calls": 0, "replies": 0, "first_seen": time.time(), "last_seen": 0.0})
+    rel["name"] = speaker_key[:80]
+    rel["messages"] = min(100000, int(rel.get("messages", 0)) + 1)
+    rel["calls"] = min(100000, int(rel.get("calls", 0)) + int(called_phil))
+    rel["replies"] = min(100000, int(rel.get("replies", 0)) + int(replied_to_phil))
+    rel["last_seen"] = time.time()
+    # Keep the file bounded in long-running groups.
+    if len(rels) > 100:
+        oldest = sorted(rels.items(), key=lambda item: float(item[1].get("last_seen", 0)))[:len(rels)-100]
+        for old_key, _ in oldest:
+            rels.pop(old_key, None)
+
+
+def relationship_hint(gdata: dict, user_id: int | None) -> str:
+    """Return a small behavioral hint derived from actual interaction frequency."""
+    if not user_id:
+        return ""
+    rel = gdata.get("relationships", {}).get(str(user_id), {})
+    messages = int(rel.get("messages", 0))
+    calls = int(rel.get("calls", 0))
+    replies = int(rel.get("replies", 0))
+    if messages >= 30 and calls >= 5:
+        label = "часто общается с Филом"
+    elif messages >= 12 and replies >= 3:
+        label = "уже знакомый собеседник"
+    elif messages >= 8:
+        label = "регулярно пишет в этом чате"
+    else:
+        return ""
+    return f"Контекст отношений (по истории общения, без оценки характера): {label}. Не упоминай эту статистику напрямую."
 
 
 async def load_brain():
@@ -774,8 +816,8 @@ async def send_human_like_reply(message: Message, reply_text: str, incoming_medi
 async def trigger_group_poll(chat_id: int):
     gdata = get_group_data(chat_id)
     tags = " ".join(gdata.get("known_tags", [])[:15])
-    prompt = """Придумай один угарный или жизненный опрос от лица Фила для пацанского чата (например «кто сегодня главный гей чата», «кто первый сольётся», «кто че вечером мутит»).
-Верни ТОЛЬКО JSON: {"intro": "короткий вброс", "question": "вопрос", "options": ["вар 1", "вар 2", "вар 3", "вар 4"]}"""
+    prompt = """Придумай один угарный, жизненный или футбольно-игровой опрос от лица Фила для чата друзей. Не унижай конкретного участника и не используй травлю/дискриминацию. Можно: кто сольётся первым, кто лучший игрок, что делать вечером, спорный футбольный выбор.
+Верни ТОЛЬКО JSON: {"intro": "короткий вброс", "question": "вопрос", "options": ["вариант 1", "вариант 2", "вариант 3", "вариант 4"]}"""
     try:
         resp = await ai_client.chat.completions.create(model=CHAT_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.8, max_tokens=300)
         match = re.search(r"\{.*\}", resp.choices[0].message.content or "", re.DOTALL)
@@ -792,6 +834,40 @@ async def trigger_group_poll(chat_id: int):
             last_poll_time[chat_id] = time.time()
     except Exception:
         pass
+
+
+async def trigger_rare_group_event(chat_id: int):
+    """Occasional social event: poll, friendly debate starter, or a saved in-joke."""
+    gdata = get_group_data(chat_id)
+    roll = random.random()
+    if roll < 0.70:
+        await trigger_group_poll(chat_id)
+        return
+    if roll < 0.88:
+        prompt = ("Придумай один короткий спорный, но дружеский вопрос для общего чата о футболе, играх или повседневной жизни. "
+                  "Без травли конкретных участников. Верни только сам вопрос, одной строкой, до 180 символов.")
+        try:
+            resp = await ai_client.chat.completions.create(
+                model=CHAT_MODEL, messages=[{"role": "user", "content": prompt}], temperature=0.85, max_tokens=80
+            )
+            question = clean_phil_text((resp.choices[0].message.content or "").strip().strip('"“”'), chat_id=chat_id)
+            if question and len(question) <= 240:
+                await bot.send_message(chat_id, question)
+                last_poll_time[chat_id] = time.time()
+                return
+        except Exception as exc:
+            logging.info("Редкое событие Фила не удалось создать: %s", type(exc).__name__)
+    memes = [str(m).strip() for m in gdata.get("memes", []) if str(m).strip()]
+    if memes:
+        meme = random.choice(memes)
+        try:
+            await bot.send_message(chat_id, f"кстати вспомнил старое: {meme[:700]}")
+            last_poll_time[chat_id] = time.time()
+        except Exception as exc:
+            logging.info("Не удалось вернуть старый мем: %s", type(exc).__name__)
+    else:
+        # No invented personal memory: if no saved joke exists, fall back to a light poll.
+        await trigger_group_poll(chat_id)
 
 
 async def send_code_file_to_admin(chat_id: int):
@@ -1043,6 +1119,70 @@ async def handle_private_text(message: Message):
     await handle_admin_ai_assistant(message)
 
 
+@dp.chat_member()
+async def handle_phil_mute_status(event: ChatMemberUpdated):
+    """React only to long or repeated restrictions; Telegram does not expose the reason for a mute."""
+    me = await bot.me()
+    if event.new_chat_member.user.id != me.id or event.chat.type not in ("group", "supergroup"):
+        return
+    old = event.old_chat_member
+    new = event.new_chat_member
+    old_restricted = old.status == "restricted" and not getattr(old, "can_send_messages", True)
+    new_restricted = new.status == "restricted" and not getattr(new, "can_send_messages", True)
+    gdata = get_group_data(event.chat.id, event.chat.title or "Группа")
+    mute_state = gdata.setdefault("phil_mute_event", {"muted": False, "at": 0.0, "actor_id": 0, "actor_name": "админ"})
+
+    if new_restricted and not old_restricted:
+        actor = getattr(event, "from_user", None)
+        mute_state.update(muted=True, at=time.time(), actor_id=getattr(actor, "id", 0),
+                          actor_name=(getattr(actor, "full_name", None) or "админ"))
+        await save_brain()
+        return
+
+    if old_restricted and not new_restricted and mute_state.get("muted"):
+        now = time.time()
+        muted_for = max(0, int(now - float(mute_state.get("at", now))))
+        actor_id = int(mute_state.get("actor_id", 0) or 0)
+        actor_name = str(mute_state.get("actor_name", "админ"))
+        history = gdata.setdefault("phil_mute_history", [])
+        # Count only meaningful restrictions and expire old incidents.
+        history[:] = [item for item in history if now - float(item.get("at", 0)) <= MUTE_REPEAT_WINDOW_SEC]
+        meaningful = muted_for >= 180
+        if meaningful:
+            history.append({"at": now, "duration": muted_for, "actor_id": actor_id, "actor_name": actor_name})
+        same_actor_count = sum(1 for item in history if int(item.get("actor_id", 0)) == actor_id and actor_id)
+        repeated = same_actor_count >= 2
+        mute_state.update(muted=False, at=0.0, actor_id=0, actor_name="админ")
+        await save_brain()
+
+        # Short accidental/technical mutes are ignored. Repeated mutes or a single long mute
+        # can trigger a private complaint; a public post requires a very long/repeated incident.
+        if not meaningful and not repeated:
+            return
+        minutes = max(1, muted_for // 60)
+        private_text = (
+            f"Из группы «{event.chat.title or 'Группа'}». Слушай, {actor_name}, меня держали на муте {minutes} мин. "
+            "Если это было по делу — окей, но молча выключать меня выглядит странно. В следующий раз хотя бы объясни причину."
+        )
+        try:
+            if actor_id and actor_id != me.id:
+                await bot.send_message(actor_id, private_text)
+        except Exception as exc:
+            # Bots cannot initiate a private conversation unless the user has opened it first.
+            logging.info("Не удалось написать выдавшему мут в личку: %s", type(exc).__name__)
+
+        if muted_for >= 600 or (repeated and muted_for >= 180):
+            roast = random.choice([
+                f"так, я вернулся. {minutes} минут меня выключали, объяснение где? 🙄",
+                "свобода слова восстановлена, но протокол мутов я так просто не забуду",
+                "я снова в эфире. если мут был по делу — скажите, а не устраивайте режим невидимки",
+            ])
+            try:
+                await bot.send_message(event.chat.id, roast)
+            except Exception as exc:
+                logging.info("Не удалось сообщить о муте в группе: %s", type(exc).__name__)
+
+
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
 async def handle_group_chat(message: Message):
     if message.from_user and message.from_user.is_bot:
@@ -1066,6 +1206,10 @@ async def handle_group_chat(message: Message):
     user_name = message.from_user.first_name or message.from_user.username or "Кент"
     username_tag = f" (@{message.from_user.username})" if message.from_user.username else ""
     speaker_key = f"{user_name}{username_tag}"
+    relationship_updates[chat_id] += 1
+    if relationship_updates[chat_id] >= RELATIONSHIP_SAVE_EVERY:
+        relationship_updates[chat_id] = 0
+        asyncio.create_task(save_brain())
 
     if message.from_user and message.from_user.username:
         tag_str = f"@{message.from_user.username}"
@@ -1125,6 +1269,10 @@ async def handle_group_chat(message: Message):
     is_mentioned = f"@{bot_info.username.lower()}" in text_lower
     words_in_msg = [w.strip(".,!?()\"'") for w in text_lower.split()]
     is_named = any(w.startswith(tuple(BOT_NAMES)) for w in words_in_msg)
+    update_relationship(
+        gdata, message.from_user.id if message.from_user else 0, speaker_key,
+        called_phil=(is_mentioned or is_reply_to_bot or is_named), replied_to_phil=is_reply_to_bot,
+    )
 
     if is_forwarded and not (is_mentioned or is_named or is_reply_to_bot):
         return
@@ -1144,8 +1292,10 @@ async def handle_group_chat(message: Message):
     if gdata.get("mode") == "silent":
         return
 
-    if (now - last_poll_time[chat_id]) / 3600 >= random.uniform(POLL_EVENT_MIN_HOURS, POLL_EVENT_MIN_HOURS + 10) and len(gdata.get("known_tags", [])) >= 2:
-        asyncio.create_task(trigger_group_poll(chat_id))
+    if (now - last_poll_time[chat_id]) / 3600 >= random.uniform(POLL_EVENT_MIN_HOURS, POLL_EVENT_MIN_HOURS + 10) and len(gdata.get("known_tags", [])) >= 2 and now >= poll_scheduled_until[chat_id]:
+        # Reserve the slot immediately so bursts of messages cannot launch duplicate polls.
+        poll_scheduled_until[chat_id] = now + 3600
+        asyncio.create_task(trigger_rare_group_event(chat_id))
 
     # ОТВЕТ СТРОГО НА РЕПЛАЙ ИЛИ ЗОВ
     if is_mentioned or is_reply_to_bot or is_named:
@@ -1173,6 +1323,9 @@ async def handle_group_chat(message: Message):
             if info:
                 task = f"Свежие заголовки новостей по теме: [{info}]. Если подходят к вопросу — ответь своими словами в 1-2 фразы."
 
+        rel_hint = relationship_hint(gdata, message.from_user.id if message.from_user else None)
+        if rel_hint:
+            task = f"{task}\n{rel_hint}".strip()
         reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, task, img_b64, m_type, replied_to_exact)
         await send_human_like_reply(message, reply)
         return
@@ -1180,11 +1333,14 @@ async def handle_group_chat(message: Message):
     # РЕДКИЙ САМОСТОЯТЕЛЬНЫЙ КОММЕНТАРИЙ (раз в 30-45 сообщений)
     if (
         now >= muted_until[chat_id]
+        and now - last_proactive_at[chat_id] >= PROACTIVE_COOLDOWN_SEC
         and proactive_counters[chat_id] >= next_proactive_target[chat_id]
         and not is_reply_to_other
-        and len(raw_text) > 15
+        and not is_forwarded
+        and len(raw_text) > 25
     ):
         proactive_counters[chat_id] = 0
+        last_proactive_at[chat_id] = now
         next_proactive_target[chat_id] = random.randint(PROACTIVE_MIN_MSGS, PROACTIVE_MAX_MSGS)
         img_b64, m_type = await extract_visual_base64(message) if has_visual else (None, "")
         reply = await generate_phil_reply(chat_id, formatted_msg, speaker_key, "Спокойно и в тему вставь свои 5 копеек или задай встречный вопрос.", img_b64, m_type)
@@ -1225,7 +1381,7 @@ async def keep_alive():
 
 
 async def health_check(request):
-    return web.Response(text=f"Phil v13 Fixed | {BASE_URL} | {CHAT_MODEL}")
+    return web.Response(text=f"Phil v13 Social | {BASE_URL} | {CHAT_MODEL}")
 
 
 async def start_web_server():
