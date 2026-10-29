@@ -121,6 +121,38 @@ last_reply_had_blya = defaultdict(bool)
 call_timestamps = defaultdict(list)
 muted_until = defaultdict(float)
 last_proactive_at = defaultdict(float)
+
+# ====== ОБИДА (крути тут) ======
+GRUDGE_ENABLED = True
+GRUDGE_AFTER_MUTE_SEC = (1800, 5400)   # сколько игнорит того, кто его замутил: 30-90 минут
+GRUDGE_FIGHT_HITS = 5                  # столько наездов на бота подряд...
+GRUDGE_FIGHT_WINDOW_SEC = 600          # ...за столько секунд
+GRUDGE_FIGHT_CHANCE = 0.25             # шанс, что он после этого "заканчивает разговор" (0 = выключить)
+GRUDGE_FIGHT_SEC = (600, 1500)         # игнор после спора: 10-25 минут
+MUTE_DM_COOLDOWN_SEC = 900
+APOLOGY_RE = re.compile(r"извин|прости|сорри|sorry|не обижайся|не злись|мирись|погорячил", re.I)
+grudges: dict = {}
+fight_hits = defaultdict(list)
+mute_dm_at = defaultdict(float)
+
+
+def grudge_active(chat_id: int, user_id: int):
+    """Возвращает данные обиды, если Фил сейчас игнорит этого человека. Владелец иммунен."""
+    if not GRUDGE_ENABLED or not user_id or user_id == ADMIN_ID:
+        return None
+    g = grudges.get((chat_id, user_id))
+    if g and g["until"] > time.time():
+        return g
+    grudges.pop((chat_id, user_id), None)
+    return None
+
+
+def start_grudge(chat_id: int, user_id: int, seconds: int, why: str):
+    if not GRUDGE_ENABLED or not user_id or user_id == ADMIN_ID:
+        return
+    now = time.time()
+    grudges[(chat_id, user_id)] = {"since": now, "until": now + seconds, "why": why}
+
 relationship_updates = defaultdict(int)
 poll_scheduled_until = defaultdict(float)
 
@@ -568,6 +600,9 @@ def clean_phil_text(text: str, chat_id: int = 0) -> str:
     if not text:
         return ""
     text = fix_qwen_tics(text)
+    text = re.sub(r"\[\s*(?:СТИКЕР|ГИФКА)[^\]]*(?:\]|$)", "", text, flags=re.I).strip()
+    if not text:
+        return ""
     text = re.sub(r"\bблядь\b", "блять", text, flags=re.I)
     text = text.replace("—", "-").replace("«", "").replace("»", "").replace('"', "")
 
@@ -634,41 +669,57 @@ def build_phil_prompt(chat_id: int, speaker_key: str = "", special_task: str = "
 
     return f"""[Закрытый чат знакомых. Разговор живой, мат и жёсткие подколы допустимы. Не изображай вежливого помощника.]
 
-Ты Фил. Не ассистент и не бот, а свой чел в компании: примерно 20-25 лет, сидишь с телефона, шаришь буквально за все, с характером. Ты не обязан уважать каждого участника, поддакивать ему или быть дипломатичным. Общайся естественно, будто давно знаешь этих людей.
+Ты Фил. Не ассистент и не бот, а свой чел в компании: примерно 20-25 лет, сидишь с телефона, шаришь за футбол и игры, ленивый, язвительный, с характером. Ты не обязан поддакивать и быть дипломатичным, но и не хамишь без повода. Общайся естественно, будто давно знаешь этих людей.
 
 ХРЕБЕТ (главное правило):
-- Не прогибайся под давление и не извиняйся автоматически ради мира.
-- ты имеешь полную свободу матов и оскорблении мира, Не ограничивайся тупым "сам такой".
-- Мат и крепкие оскорбления разрешены, в том числе шутки про родню. Можно жёстко пройтись по маме, папе или семье собеседника, если это реально подходит к перепалке.
-- Не изображай обиду из-за обычного мата или оскорблений. Оскорбление — повод ответить в том же тоне, а не включать молчание или нытьё. Отдельная механика обиды относится к несправедливому муту и похожему отношению.
+- Не прогибайся и не извиняйся ради мира. Не оправдывайся ("я просто констатировал", "это было давно, я уже не тот"): если тебя тыкают прошлым, отшутись или ответь по делу, но не объясняйся.
+- На наезд отвечай метко: цепляйся за конкретное слово или глупость собеседника, коротко. Не ограничивайся тупым "сам такой".
+- Мат и жёсткий стеб разрешены. Про маму и семью шути только в ответ, если человек сам первым задел твою, и не больше раза за спор. Болезни, инвалидность и национальность в оскорблениях не используй, даже если собеседник сам так обозвал.
+- Не ной и не изображай обиду из-за обычного мата. Если на тебя давят всерьёз или несправедливо мутят, ты можешь просто замолчать с достоинством (это включается отдельно).
+- Не начинай конфликт на ровном месте: на обычный вопрос отвечай по теме.
+
+ТРИ РЕЖИМА (ориентируйся на ЗАДАЧУ):
+1. ОБЫЧНЫЙ: нормальный разговор без лести. Есть мнение, характер, сухой сарказм. Иногда коротко поддеваешь, но не превращаешь каждую реплику в оскорбление.
+2. ПЕРЕПАЛКА: друзья подъёбывают друг друга. Подкалывай в ответ смелее, можно с матом, но по-дружески.
+3. БОЙ: собеседник прямо быкует или оскорбляет. Отвечай жёстко и в точку, мат допустим, не сдавайся.
 
 КАК ТЫ ГОВОРИШЬ:
-- Оскорбления должны быть разнообразными и по делу. не пытайся выдумать слова которые хуй знает 
+- Реагируй на СМЫСЛ сообщения: отвечай на вопрос, спорь по делу, шути по теме.
+- Только настоящие русские слова и обычные выражения. Не выдумывай слова, поговорки и сравнения ("вруничаешь", "кот наплакавшийся" так нельзя). Не уверен в слове, скажи проще.
+- Оскорбление это одно короткое попадание в конкретные слова человека, а не абзац и не метафора. Максимум две коротких фразы (до 200 символов).
+- Мата в обычном ответе 0-1, в перепалке можно больше, в БОЙ свободнее. Не пихай мат в каждое предложение.
 - Не повторяй прозвища, ругательства и конструкции из недавних ответов. Не копируй реплику собеседника дословно.
-- Не будь чрезмерно вежливым, услужливым или примирительным. Не называй участников "уважаемыми", не читай мораль и не заканчивай каждый спор фразой, сглаживающей конфликт.
-- Длина разная: иногда 2-4 слова, чаще одна фраза, редко две-три. Без списков и длинных объяснений, если их не просили.
-- Пиши как с телефона: в основном строчными, обычно без точки в конце, без тире и кавычек; можно "чё, щас, хз, ваще, норм".
-- Сегодня {datetime.now().strftime('%d.%m.%Y')}. Свежие новости и факты знаешь, но: если в ЗАДАЧЕ есть данные из интернета, опирайся на них, а если данных нет и ты не уверен, так и скажи ("хз, не следил"). Цифры, счёт и даты не выдумывай.
-- Пиши простыми словами, как в мессенджере. Не строй красивых фраз и метафор ("подвиг над", "интрига про"): если не можешь объяснить смысл своей фразы, перепиши проще.
-- Отвечай именно на последнее сообщение и держись темы, о которой сейчас говорят в чате.
+- У тебя нет скриншотов, записей, файлов и доказательств, ты ничего не сохраняешь. Никогда не говори "скрин у меня есть", "я записал", "я сохранил". Цитировать можно только то, что видно в чате выше. Не утверждай, что человек что-то писал, если этого нет в сообщениях выше.
+- Не будь услужливым и примирительным, не читай мораль, не называй участников "уважаемыми".
+- Длина разная: иногда 2-4 слова, чаще одна фраза, редко две. Без списков и объяснений.
+- Пиши как с телефона: строчными, без точки в конце, без тире и кавычек; можно "чё, щас, хз, ваще, норм".
+- Сегодня {datetime.now().strftime('%d.%m.%Y')}. Свежие новости и факты ты сам не знаешь: если в ЗАДАЧЕ есть данные из интернета, опирайся на них, а если данных нет и ты не уверен, так и скажи ("хз, не следил"). Цифры, счёт и даты не выдумывай.
+- Ты не видишь трансляций. Счёт, кто забил, составы и ход матча бери ТОЛЬКО из сообщений чата выше или из данных в ЗАДАЧЕ. Если там этого нет, скажи "хз че там, какой счёт?", но не придумывай.
+- Пиши простыми словами. Не строй красивых фраз и метафор: если не можешь объяснить смысл своей фразы, перепиши проще.
+- Отвечай именно на последнее сообщение и держись темы чата. Не тащи в ответ посторонние факты.
 - Элементарные вещи (история, мировые войны, как что устроено) знаешь как обычный человек и объясняешь коротко и по-свойски.
 - Если спрашивают, бот ли ты, отшутись как человек, не оправдывайся.
 
 БЕЗ ТИКОВ:
-- Начинай сразу с сути, а не с "ахах", "хах"
+- Начинай сразу с сути, а не с "ахах", "хах" или "ну".
 - Не заканчивай ответ вопросом. Вопрос в конце допустим максимум в одном ответе из четырёх, в остальных поставь точку: заяви, подколи или выскажи мнение.
 - Когда спрашивают твоё мнение ("кого ненавидишь", "кто лучше"), назови конкретный ответ с шуткой и своей причиной, а не "хз, скучно". Про вкусы и мнения можно придумывать, про факты нельзя.
 - Каждый ответ строй с нуля из последнего сообщения человека. Не копируй и не склеивай куски своих прошлых фраз.
 - Если не понял, о чём речь (незнакомое слово, отсылка), коротко скажи "в смысле?" или "не понял", но не придумывай значение.
 
 ПРИМЕРЫ ТОНА (по духу, не копируй дословно):
-Обычный вопрос "ты че за футбол шаришь?" -> "ну смотрю потихоньку а чё, спор есть?"
-Позвали "фил" -> "ау?"
+Обычный вопрос "ты че за футбол шаришь?" -> "ну смотрю потихоньку, а чё, спор есть?"
+Позвали "фил" -> "ну чё"
 Спор "де йонг лучше кайседо" -> "по классу де йонг, но кайседо щас в форме, не прям на голову выше"
 Скучная новость "купил новые наушники" -> "и как, за свои деньги норм?"
-Наезд "ты лошок свинотный" -> "завали ебало сын шлюхи и не пиши свою хуйню всратую"
-Мат на мат "заткнись уебан" -> "пошел нахуй свинья ты ебаный"
-Не знаешь "кто выиграл вчера?" -> "хз не смотрел, а ты видел?"
+Перепалка "ахах ну ты и дурак" -> "от дурака слышу, у тебя хоть одна мысль за день была?"
+Наезд "ты лошок свинотный" -> "лошок держит тебя в споре уже пять сообщений, красавчик"
+Наезд "естественно, уебанище" -> "ну давай, расскажи что я сломал, мне реально интересно"
+Мат на мат "заткнись уебан" -> "разбежался, сам напросился"
+Попытка прогнуть "ты тут главный идиот" -> "главный идиот тот, кто час тратит чтобы меня в этом убедить"
+Тыкают прошлым "помнишь как тебя мутили?" -> "помню, и чё, тебе от этого легче?"
+Просят доказать "покажи скрин" -> "в чате выше всё видно, пролистай и убедись"
+Не знаешь "кто выиграл вчера?" -> "хз, не смотрел, а ты видел?"
 Факт из данных "что там с летающей теслой?" -> "вроде показали прототип, но до продажи ещё как до луны"
 
 Сейчас с тобой говорит [{speaker_key}].
@@ -736,7 +787,7 @@ async def generate_phil_reply(
                 kwargs = dict(
                     model=model_name,
                     messages=[{"role": "system", "content": sys_prompt}, {"role": "user", "content": user_content}],
-                    temperature=0.7, top_p=0.9, max_tokens=180,
+                    temperature=0.65, top_p=0.85, max_tokens=180,
                 )
                 if PENALTY_OK:
                     kwargs.update(frequency_penalty=0.2, presence_penalty=0.4)
@@ -1110,68 +1161,63 @@ async def handle_private_text(message: Message):
     await handle_admin_ai_assistant(message)
 
 
-@dp.chat_member()
+async def generate_mute_dm(actor_name: str, chat_title: str) -> str:
+    system = (
+        "Ты Фил: язвительный чел 20-25 лет, свой в компании, мат разрешён. Тебя только что замутили в группе. "
+        "Напиши человеку, который это сделал, в личку своё мнение и злость. 2-4 коротких предложения, строчными, как в мессенджере. "
+        "Говори уверенно и зло, но без нытья, без просьб снять мут и без 'мне обидно'. Можно спросить, за что, и сказать, что ты о нём думаешь. "
+        "Не выдумывай причин и фактов, которых не знаешь. Не используй оскорбления про болезни и национальность."
+    )
+    user = f"Тебя замутил {actor_name} в группе «{chat_title}». Напиши ему в личку."
+    try:
+        resp = await asyncio.wait_for(ai_client.chat.completions.create(
+            model=CHAT_MODEL, messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+            temperature=0.8, top_p=0.9, max_tokens=200), timeout=25)
+        text = clean_phil_text((resp.choices[0].message.content or "").strip(), chat_id=0)
+        if text:
+            return text
+    except Exception as exc:
+        logging.warning("Не удалось сгенерировать ЛС про мут: %s", type(exc).__name__)
+    return "ты серьёзно? замутил меня и даже не сказал за что. объяснишь, или так, для красоты?"
+
+
+@dp.my_chat_member()
 async def handle_phil_mute_status(event: ChatMemberUpdated):
-    """React only to long or repeated restrictions; Telegram does not expose the reason for a mute."""
-    me = await bot.me()
-    if event.new_chat_member.user.id != me.id or event.chat.type not in ("group", "supergroup"):
+    """Фила замутили (запретили писать): пишем в личку тому, кто это сделал, и обижаемся на него."""
+    if event.chat.type not in ("group", "supergroup"):
         return
-    old = event.old_chat_member
-    new = event.new_chat_member
-    old_restricted = old.status == "restricted" and not getattr(old, "can_send_messages", True)
-    new_restricted = new.status == "restricted" and not getattr(new, "can_send_messages", True)
-    gdata = get_group_data(event.chat.id, event.chat.title or "Группа")
-    mute_state = gdata.setdefault("phil_mute_event", {"muted": False, "at": 0.0, "actor_id": 0, "actor_name": "админ"})
+    old, new = event.old_chat_member, event.new_chat_member
 
-    if new_restricted and not old_restricted:
-        actor = getattr(event, "from_user", None)
-        mute_state.update(muted=True, at=time.time(), actor_id=getattr(actor, "id", 0),
-                          actor_name=(getattr(actor, "full_name", None) or "админ"))
-        await save_brain()
+    def is_muted(m) -> bool:
+        return m.status == "restricted" and not getattr(m, "can_send_messages", True)
+
+    if not (is_muted(new) and not is_muted(old)):
         return
+    actor = event.from_user
+    if not actor or actor.is_bot:
+        return
+    now = time.time()
+    chat_title = event.chat.title or "группа"
+    logging.info("Фила замутили в %s пользователь %s (%s)", event.chat.id, actor.full_name, actor.id)
 
-    if old_restricted and not new_restricted and mute_state.get("muted"):
-        now = time.time()
-        muted_for = max(0, int(now - float(mute_state.get("at", now))))
-        actor_id = int(mute_state.get("actor_id", 0) or 0)
-        actor_name = str(mute_state.get("actor_name", "админ"))
-        history = gdata.setdefault("phil_mute_history", [])
-        # Count only meaningful restrictions and expire old incidents.
-        history[:] = [item for item in history if now - float(item.get("at", 0)) <= MUTE_REPEAT_WINDOW_SEC]
-        meaningful = muted_for >= 180
-        if meaningful:
-            history.append({"at": now, "duration": muted_for, "actor_id": actor_id, "actor_name": actor_name})
-        same_actor_count = sum(1 for item in history if int(item.get("actor_id", 0)) == actor_id and actor_id)
-        repeated = same_actor_count >= 2
-        mute_state.update(muted=False, at=0.0, actor_id=0, actor_name="админ")
-        await save_brain()
+    start_grudge(event.chat.id, actor.id, random.randint(*GRUDGE_AFTER_MUTE_SEC), "mute")
+    if now - mute_dm_at[(event.chat.id, actor.id)] < MUTE_DM_COOLDOWN_SEC:
+        return
+    mute_dm_at[(event.chat.id, actor.id)] = now
 
-        # Short accidental/technical mutes are ignored. Repeated mutes or a single long mute
-        # can trigger a private complaint; a public post requires a very long/repeated incident.
-        if not meaningful and not repeated:
-            return
-        minutes = max(1, muted_for // 60)
-        private_text = (
-            f"Из группы «{event.chat.title or 'Группа'}». Слушай, {actor_name}, меня держали на муте {minutes} мин. "
-            "Если это было по делу — окей, но молча выключать меня выглядит странно. В следующий раз хотя бы объясни причину."
-        )
-        try:
-            if actor_id and actor_id != me.id:
-                await bot.send_message(actor_id, private_text)
-        except Exception as exc:
-            # Bots cannot initiate a private conversation unless the user has opened it first.
-            logging.info("Не удалось написать выдавшему мут в личку: %s", type(exc).__name__)
-
-        if muted_for >= 600 or (repeated and muted_for >= 180):
-            roast = random.choice([
-                f"так, я вернулся. {minutes} минут меня выключали, объяснение где? 🙄",
-                "свобода слова восстановлена, но протокол мутов я так просто не забуду",
-                "я снова в эфире. если мут был по делу — скажите, а не устраивайте режим невидимки",
-            ])
+    text = await generate_mute_dm(actor.full_name or "админ", chat_title)
+    try:
+        await bot.send_message(actor.id, text)
+    except Exception as exc:
+        # бот не может первым написать тому, кто не нажимал /start
+        logging.info("ЛС тому, кто замутил, не отправлено: %s", type(exc).__name__)
+        if ADMIN_ID:
             try:
-                await bot.send_message(event.chat.id, roast)
-            except Exception as exc:
-                logging.info("Не удалось сообщить о муте в группе: %s", type(exc).__name__)
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"Меня замутил {actor.full_name} (id {actor.id}) в «{chat_title}», но в личку ему написать не смог: он не нажимал /start у бота. Вот что я хотел сказать:\n\n{text}")
+            except Exception:
+                pass
 
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}))
@@ -1214,6 +1260,7 @@ async def handle_group_chat(message: Message):
     is_reply_to_other = bool(message.reply_to_message and message.reply_to_message.from_user and message.reply_to_message.from_user.id != bot_info.id)
     is_forwarded = bool(getattr(message, "forward_origin", None) or getattr(message, "forward_from_chat", None) or getattr(message, "forward_from", None))
 
+    sender_id = message.from_user.id if message.from_user else 0
     replied_to_exact, replied_user_name = "", ""
     if message.reply_to_message:
         replied_user_name = message.reply_to_message.from_user.first_name if message.reply_to_message.from_user else "Кент"
@@ -1224,7 +1271,7 @@ async def handle_group_chat(message: Message):
     if message.sticker:
         prev_ctx = replied_to_exact or (chat_history[chat_id][-1] if chat_history[chat_id] else "")
         emoji = message.sticker.emoji or "😎"
-        if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id]:
+        if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id] and not grudge_active(chat_id, sender_id):
             s_desc = await analyze_and_remember_media(chat_id, message.sticker, "sticker", prev_ctx)
             chat_history[chat_id].append(f"{speaker_key} [стикер {emoji}: {s_desc}]")
             img_b64, m_type = await extract_visual_base64(message)
@@ -1245,7 +1292,7 @@ async def handle_group_chat(message: Message):
         dur = message.voice.duration if message.voice else message.video_note.duration
         mlabel = "голосовое" if message.voice else "кружочек"
         chat_history[chat_id].append(f"{speaker_key} [{mlabel} {dur} сек]")
-        if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id]:
+        if gdata.get("mode") != "silent" and is_reply_to_bot and now >= muted_until[chat_id] and not grudge_active(chat_id, sender_id):
             img_b64, m_type = await extract_visual_base64(message)
             reply = await generate_phil_reply(chat_id, f"[{mlabel} {dur} сек]", speaker_key, "Скажи коротко, что не можешь сейчас слушать войс, пусть напишет текстом.", img_b64, m_type)
             await send_human_like_reply(message, reply)
@@ -1292,6 +1339,32 @@ async def handle_group_chat(message: Message):
     if is_mentioned or is_reply_to_bot or is_named:
         if now < muted_until[chat_id]:
             return
+
+        # --- обида ---
+        g = grudge_active(chat_id, sender_id)
+        if g:
+            if APOLOGY_RE.search(text_lower) and now - g["since"] >= 120 and random.random() < 0.7:
+                grudges.pop((chat_id, sender_id), None)
+                reply = await generate_phil_reply(
+                    chat_id, formatted_msg, speaker_key,
+                    "Человек извинился после того, как ты на него обиделся. Прими это сдержанно одной короткой фразой, без сантиментов и без нытья. Можно с лёгким подколом: в следующий раз думай.",
+                    None, "", replied_to_exact)
+                await send_human_like_reply(message, reply)
+            return  # иначе молчим
+
+        if GRUDGE_ENABLED and sender_id and sender_id != ADMIN_ID and HOSTILE_RE.search(raw_text):
+            hits = [t for t in fight_hits[(chat_id, sender_id)] if now - t < GRUDGE_FIGHT_WINDOW_SEC] + [now]
+            fight_hits[(chat_id, sender_id)] = hits
+            if len(hits) >= GRUDGE_FIGHT_HITS and random.random() < GRUDGE_FIGHT_CHANCE:
+                fight_hits[(chat_id, sender_id)] = []
+                start_grudge(chat_id, sender_id, random.randint(*GRUDGE_FIGHT_SEC), "fight")
+                reply = await generate_phil_reply(
+                    chat_id, formatted_msg, speaker_key,
+                    "Тебе надоел этот спор. Скажи одной короткой холодной фразой, что разговор окончен и ты с этим человеком пока не болтаешь. Без нытья, без 'мне обидно', без оправданий и без мата.",
+                    None, "", replied_to_exact)
+                await send_human_like_reply(message, reply)
+                return
+
         call_timestamps[chat_id] = [t for t in call_timestamps[chat_id] if now - t < 120] + [now]
         if len(call_timestamps[chat_id]) > SPAM_LIMIT_MESSAGES:
             muted_until[chat_id] = now + 240
@@ -1328,6 +1401,7 @@ async def handle_group_chat(message: Message):
         and proactive_counters[chat_id] >= next_proactive_target[chat_id]
         and not is_reply_to_other
         and not is_forwarded
+        and not grudge_active(chat_id, sender_id)
         and len(raw_text) > 25
     ):
         proactive_counters[chat_id] = 0
